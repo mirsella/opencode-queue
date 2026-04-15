@@ -14,15 +14,15 @@ This plugin adds a `/queue ...` prefix that keeps the current run focused instea
 
 ## Install
 
-This repo is not published to npm, so install it as a local plugin file.
+Add it to your OpenCode plugin list:
 
-```bash
-mkdir -p ~/.config/opencode/plugins
-curl -fsSL https://raw.githubusercontent.com/mirsella/opencode-queue/main/index.ts \
-  -o ~/.config/opencode/plugins/queue.ts
+```jsonc
+{
+  "plugin": ["opencode-queue"]
+}
 ```
 
-OpenCode loads files in `~/.config/opencode/plugins/` automatically at startup.
+OpenCode installs npm plugins automatically at startup.
 
 Restart OpenCode after installing.
 

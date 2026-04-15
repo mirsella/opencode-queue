@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Queue OpenCode prompts and slash commands until the agent is idle",
+  "main": "./index.ts",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -19,8 +20,16 @@
   },
   "homepage": "https://github.com/mirsella/opencode-queue#readme",
   "license": "MIT",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "exports": {
     ".": "./index.ts"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
