@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-queue",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Queue OpenCode prompts and slash commands until the agent is idle",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "queue"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirsella/opencode-queue.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mirsella/opencode-queue/issues"
+  },
+  "homepage": "https://github.com/mirsella/opencode-queue#readme",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/sdk": "latest",
+    "typescript": "^5.9.3"
+  }
+}
