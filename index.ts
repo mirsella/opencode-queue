@@ -13,7 +13,7 @@ const COMMAND = /^\/(\S+)(?:\s+([\s\S]*))?$/
 
 type InputPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput
 type Info = { agent: string; model: { providerID: string; modelID: string } }
-type Item = { info: Info; command: string; arguments: string } | { info: Info; parts: InputPart[] }
+type Item = { info: Info; text: string; parts?: InputPart[]; command?: string; arguments?: string }
 
 const label = (body: string, files: number) => {
   const text = body.trim() || `${files} attachment${files === 1 ? "" : "s"}`
@@ -25,14 +25,72 @@ const parseCommand = (body: string) => {
   return match ? { command: match[1], arguments: match[2] ?? "" } : undefined
 }
 
-const QueuePlugin: Plugin = async ({ client }) => {
+export const QueuePlugin: Plugin = async ({ client }) => {
   const queue = new Map<string, Item[]>()
   const hidden = new Set<string>()
   const busy = new Set<string>()
   const flushing = new Set<string>()
 
-  const toast = (message: string, variant: "info" | "error") =>
-    client.tui.showToast({ body: { message, variant, duration: 2500 } }).catch(() => undefined)
+  const toast = (message: string, variant: "info" | "error", duration = 2500) =>
+    client.tui.showToast({ body: { message, variant, duration } }).catch(() => undefined)
+
+  const hide = (id: string, text: TextPart) => {
+    hidden.add(id)
+    text.text = ""
+    text.synthetic = true
+    text.ignored = true
+  }
+
+  const enqueue = (sid: string, item: Item) => {
+    const items = queue.get(sid)
+    if (items) items.push(item)
+    else queue.set(sid, [item])
+  }
+
+  const summary = (sid: string) => {
+    const items = queue.get(sid) ?? []
+    if (!items.length) return "Queue is empty"
+    return items.map((item, i) => `${i + 1}. ${item.text}`).join("\n")
+  }
+
+  const replay = async (sid: string, item: Item) => {
+    if (!item.command || item.arguments === undefined) {
+      if (!item.parts?.length) {
+        console.warn("QueuePlugin skipped queued item without replayable content")
+        return
+      }
+
+      await client.session.prompt({
+        path: { id: sid },
+        body: {
+          agent: item.info.agent,
+          model: item.info.model,
+          parts: item.parts.map((part) => ({ ...part, id: undefined })),
+        },
+      })
+      return
+    }
+
+    await client.session.prompt({
+      path: { id: sid },
+      body: {
+        agent: item.info.agent,
+        model: item.info.model,
+        noReply: true,
+        parts: [{ type: "text", text: item.text }],
+      },
+    })
+
+    await client.session.command({
+      path: { id: sid },
+      body: {
+        agent: item.info.agent,
+        model: `${item.info.model.providerID}/${item.info.model.modelID}`,
+        command: item.command,
+        arguments: item.arguments,
+      },
+    })
+  }
 
   const flush = async (sid: string) => {
     if (flushing.has(sid)) return
@@ -46,28 +104,7 @@ const QueuePlugin: Plugin = async ({ client }) => {
       while (list.length) {
         const item = list.shift()
         if (!item) break
-
-        if ("command" in item) {
-          await client.session.command({
-            path: { id: sid },
-            body: {
-              agent: item.info.agent,
-              model: `${item.info.model.providerID}/${item.info.model.modelID}`,
-              command: item.command,
-              arguments: item.arguments,
-            },
-          })
-          continue
-        }
-
-        await client.session.prompt({
-          path: { id: sid },
-          body: {
-            agent: item.info.agent,
-            model: item.info.model,
-            parts: item.parts.map((part) => ({ ...part, id: undefined })),
-          },
-        })
+        await replay(sid, item)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -101,10 +138,16 @@ const QueuePlugin: Plugin = async ({ client }) => {
       if (body === undefined) return
 
       const files = output.parts.filter((part): part is FilePart => part.type === "file")
-      if (!body.trim() && !files.length) return
+      const trimmed = body.trim()
+
+      if ((!trimmed || trimmed === "list") && !files.length) {
+        hide(output.message.id, text)
+        await toast(summary(sessionID), "info", 5000)
+        return
+      }
 
       if (!busy.has(sessionID)) {
-        if (body.trimStart().startsWith("/")) return
+        if (trimmed.startsWith("/")) return
         text.text = body
         return
       }
@@ -126,15 +169,11 @@ const QueuePlugin: Plugin = async ({ client }) => {
 
       const info = { agent: output.message.agent, model: { ...output.message.model } }
       const command = parseCommand(body)
-      const item = command ? { info, ...command } : { info, parts }
-      const list = queue.get(sessionID)
-      if (list) list.push(item)
-      else queue.set(sessionID, [item])
+      const item = command ? { info, text: trimmed, ...command } : { info, text: label(body, files.length), parts }
 
-      const note = label(body, files.length)
-      hidden.add(output.message.id)
-      text.text = `[queued] ${note}`
-      await toast(`Queued: ${note}`, "info")
+      enqueue(sessionID, item)
+      hide(output.message.id, text)
+      await toast(`Queued: ${item.text}`, "info")
     },
     "experimental.chat.messages.transform": async (_, output) => {
       output.messages = output.messages.filter((msg) => !hidden.has(msg.info.id))
@@ -142,5 +181,4 @@ const QueuePlugin: Plugin = async ({ client }) => {
   }
 }
 
-export { QueuePlugin }
 export default QueuePlugin
