@@ -2,7 +2,7 @@
 
 Queue OpenCode input until the current agent run is actually idle.
 
-This plugin adds a `/queue ...` prefix that keeps the current run focused instead of injecting your next message into the still-running loop.
+This plugin adds a real `/queue` slash command that keeps the current run focused instead of injecting your next message into the still-running loop.
 
 ## What it does
 
@@ -11,6 +11,7 @@ This plugin adds a `/queue ...` prefix that keeps the current run focused instea
 - Hides queued placeholders from both the UI transcript and the running agent
 - Replays queued input in order once the session becomes idle
 - Replays queued commands as a visible `/command` message before executing them
+- Registers `/queue` as a real OpenCode slash command
 - Shows the current queue with `/queue list`
 - Clears the current queue with `/queue clear`
 
@@ -40,14 +41,22 @@ While the agent is busy:
 /queue clear
 ```
 
+When the session is idle:
+
+```text
+/queue hello
+/queue /review
+/queue
+```
+
 Queued items stay hidden while the current run is still working, then replay automatically when the session becomes idle.
 
 ## Notes
 
 - This is a `/queue` plugin, not a keyboard shortcut plugin. OpenCode plugins cannot currently register custom TUI keybindings.
 - Idle `/queue some text` is treated like a normal prompt with the `/queue` prefix removed.
-- Idle `/queue /command` is left alone and is not intercepted.
-- `/queue list` shows the in-memory queue for the current session.
+- Idle `/queue /command` immediately runs the nested command.
+- `/queue` and `/queue list` show the in-memory queue for the current session.
 - `/queue clear` drops all currently queued items for the current session.
 
 ## License

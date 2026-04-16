@@ -10,10 +10,11 @@ import type {
 
 const QUEUE = /^\/queue(?:\s+([\s\S]*))?$/
 const COMMAND = /^\/(\S+)(?:\s+([\s\S]*))?$/
+const HANDLED = "__QUEUE_HANDLED__"
 
 type InputPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput
 type Info = { agent: string; model: { providerID: string; modelID: string } }
-type Item = { info: Info; text: string; parts?: InputPart[]; command?: string; arguments?: string }
+type Item = { info: Info; text: string; parts?: InputPart[]; command?: string; arguments?: string; files?: FilePartInput[] }
 
 const label = (body: string, files: number) => {
   const text = body.trim() || `${files} attachment${files === 1 ? "" : "s"}`
@@ -83,7 +84,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
         agent: item.info.agent,
         model: item.info.model,
         noReply: true,
-        parts: [{ type: "text", text: item.text }],
+        parts: [{ type: "text", text: item.text }, ...(item.files ?? [])],
       },
     })
 
@@ -94,7 +95,8 @@ export const QueuePlugin: Plugin = async ({ client }) => {
         model: `${item.info.model.providerID}/${item.info.model.modelID}`,
         command: item.command,
         arguments: item.arguments,
-      },
+        parts: item.files,
+      } as any,
     })
   }
 
@@ -124,6 +126,13 @@ export const QueuePlugin: Plugin = async ({ client }) => {
   }
 
   return {
+    config: async (cfg) => {
+      cfg.command ??= {}
+      cfg.command.queue = {
+        template: "",
+        description: "Queue input until the session is idle",
+      }
+    },
     event: async ({ event }) => {
       if (event.type !== "session.status") return
 
@@ -135,6 +144,47 @@ export const QueuePlugin: Plugin = async ({ client }) => {
 
       busy.delete(sid)
       await flush(sid)
+    },
+    "command.execute.before": async (input, output) => {
+      if (input.command !== "queue") return
+
+      const body = input.arguments ?? ""
+      const text = body.trim()
+      const files = output.parts.filter((part): part is FilePart => part.type === "file").map((part) => ({ ...part }))
+
+      if ((!text || text === "list" || text === "clear") && !files.length) {
+        await toast(text === "clear" ? clear(input.sessionID) : summary(input.sessionID), "info", 5000)
+        throw new Error(HANDLED)
+      }
+
+      if (!busy.has(input.sessionID)) {
+        const cmd = parseCommand(body)
+        if (!cmd) {
+          output.parts.length = 0
+          output.parts.push({ type: "text", text: body } as any, ...files)
+          return
+        }
+
+        await client.session.prompt({
+          path: { id: input.sessionID },
+          body: {
+            noReply: true,
+            parts: [{ type: "text", text }, ...files],
+          } as any,
+        })
+        await client.session.command({
+          path: { id: input.sessionID },
+          body: {
+            command: cmd.command,
+            arguments: cmd.arguments,
+            parts: files,
+          } as any,
+        })
+        throw new Error(HANDLED)
+      }
+
+      output.parts.length = 0
+      output.parts.push({ type: "text", text: `/queue ${body}` } as any, ...files)
     },
     "chat.message": async ({ sessionID }, output) => {
       const text = output.parts.find((part): part is TextPart => part.type === "text" && !part.synthetic)
@@ -175,7 +225,9 @@ export const QueuePlugin: Plugin = async ({ client }) => {
 
       const info = { agent: output.message.agent, model: { ...output.message.model } }
       const command = parseCommand(body)
-      const item = command ? { info, text: trimmed, ...command } : { info, text: label(body, files.length), parts }
+      const item = command
+        ? { info, text: trimmed, files, ...command }
+        : { info, text: label(body, files.length), parts }
 
       enqueue(sessionID, item)
       hide(output.message.id, text)
