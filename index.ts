@@ -53,6 +53,12 @@ export const QueuePlugin: Plugin = async ({ client }) => {
     return items.map((item, i) => `${i + 1}. ${item.text}`).join("\n")
   }
 
+  const clear = (sid: string) => {
+    const count = queue.get(sid)?.length ?? 0
+    queue.delete(sid)
+    return count ? `Cleared ${count} queued item${count === 1 ? "" : "s"}` : "Queue is empty"
+  }
+
   const replay = async (sid: string, item: Item) => {
     if (!item.command || item.arguments === undefined) {
       if (!item.parts?.length) {
@@ -140,9 +146,9 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       const files = output.parts.filter((part): part is FilePart => part.type === "file")
       const trimmed = body.trim()
 
-      if ((!trimmed || trimmed === "list") && !files.length) {
+      if ((!trimmed || trimmed === "list" || trimmed === "clear") && !files.length) {
         hide(output.message.id, text)
-        await toast(summary(sessionID), "info", 5000)
+        await toast(trimmed === "clear" ? clear(sessionID) : summary(sessionID), "info", 5000)
         return
       }
 

@@ -12,6 +12,7 @@ This plugin adds a `/queue ...` prefix that keeps the current run focused instea
 - Replays queued input in order once the session becomes idle
 - Replays queued commands as a visible `/command` message before executing them
 - Shows the current queue with `/queue list`
+- Clears the current queue with `/queue clear`
 
 ## Install
 
@@ -36,6 +37,7 @@ While the agent is busy:
 /queue /review
 /queue /commit
 /queue list
+/queue clear
 ```
 
 Queued items stay hidden while the current run is still working, then replay automatically when the session becomes idle.
@@ -46,6 +48,7 @@ Queued items stay hidden while the current run is still working, then replay aut
 - Idle `/queue some text` is treated like a normal prompt with the `/queue` prefix removed.
 - Idle `/queue /command` is left alone and is not intercepted.
 - `/queue list` shows the in-memory queue for the current session.
+- `/queue clear` drops all currently queued items for the current session.
 
 ## License
 
