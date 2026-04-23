@@ -12,7 +12,7 @@ This plugin adds a real `/queue` slash command that keeps the current run focuse
 - Hides queued placeholders from both the UI transcript and the running agent
 - Replays queued input in order once the session becomes idle
 - Replays queued commands as a visible `/command` message before executing them
-- Replays queued shell commands as a visible `!command` message before running them
+- Replays queued shell commands as shell tool blocks without adding a literal `!command` user message
 - Registers `/queue` as a real OpenCode slash command
 - Shows the current queue with `/queue list`
 - Clears the current queue with `/queue clear`
@@ -60,7 +60,7 @@ Queued items stay hidden while the current run is still working, then replay aut
 - This is a `/queue` plugin, not a keyboard shortcut plugin. OpenCode plugins cannot currently register custom TUI keybindings.
 - Idle `/queue some text` is treated like a normal prompt with the `/queue` prefix removed.
 - Idle `/queue /command` immediately runs the nested command.
-- Idle `/queue !command` immediately runs the shell command.
+- Idle `/queue !command` immediately runs the shell command as a shell tool block.
 - `/queue` and `/queue list` show the in-memory queue for the current session.
 - `/queue clear` drops all currently queued items for the current session.
 - Shell commands do not support attached files.
