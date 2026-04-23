@@ -14,7 +14,16 @@ const HANDLED = "__QUEUE_HANDLED__"
 
 type InputPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput
 type Info = { agent: string; model: { providerID: string; modelID: string } }
-type Item = { info: Info; text: string; parts?: InputPart[]; command?: string; arguments?: string; files?: FilePartInput[] }
+type Run = { agent: string; model?: Info["model"] }
+type Item = {
+  info: Info
+  text: string
+  parts?: InputPart[]
+  command?: string
+  arguments?: string
+  files?: FilePartInput[]
+  shell?: string
+}
 
 const label = (body: string, files: number) => {
   const text = body.trim() || `${files} attachment${files === 1 ? "" : "s"}`
@@ -24,6 +33,11 @@ const label = (body: string, files: number) => {
 const parseCommand = (body: string) => {
   const match = body.trim().match(COMMAND)
   return match ? { command: match[1], arguments: match[2] ?? "" } : undefined
+}
+
+const parseShell = (body: string) => {
+  const text = body.trim()
+  return text.startsWith("!") ? text.slice(1).trim() : undefined
 }
 
 export const QueuePlugin: Plugin = async ({ client }) => {
@@ -60,7 +74,54 @@ export const QueuePlugin: Plugin = async ({ client }) => {
     return count ? `Cleared ${count} queued item${count === 1 ? "" : "s"}` : "Queue is empty"
   }
 
+  const latest = async (sid: string): Promise<Run> => {
+    const result = await client.session.messages({ path: { id: sid }, query: { limit: 100 } }).catch((error) => {
+      console.warn("QueuePlugin could not inspect session messages for shell replay", error)
+      return []
+    })
+    const messages = Array.isArray(result) ? result : (result.data ?? [])
+    const found = [...messages]
+      .reverse()
+      .flatMap((msg): Run[] => {
+        if (msg.info.role === "user") return [{ agent: msg.info.agent, model: msg.info.model }]
+        if (msg.info.role === "assistant") {
+          return [{ agent: msg.info.mode, model: { providerID: msg.info.providerID, modelID: msg.info.modelID } }]
+        }
+        return []
+      })
+      .find(Boolean)
+    if (found) return found
+    console.warn("QueuePlugin shell replay fell back to the build agent because the session has no message context")
+    return { agent: "build" }
+  }
+
+  const shell = async (sid: string, item: { text: string; shell: string; info?: Run }) => {
+    await client.session.prompt({
+      path: { id: sid },
+      body: {
+        agent: item.info?.agent,
+        model: item.info?.model,
+        noReply: true,
+        parts: [{ type: "text", text: item.text }],
+      },
+    })
+
+    await client.session.shell({
+      path: { id: sid },
+      body: {
+        agent: item.info?.agent ?? "build",
+        model: item.info?.model,
+        command: item.shell,
+      },
+    })
+  }
+
   const replay = async (sid: string, item: Item) => {
+    if (item.shell !== undefined) {
+      await shell(sid, { text: item.text, shell: item.shell, info: item.info })
+      return
+    }
+
     if (!item.command || item.arguments === undefined) {
       if (!item.parts?.length) {
         console.warn("QueuePlugin skipped queued item without replayable content")
@@ -151,13 +212,30 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       const body = input.arguments ?? ""
       const text = body.trim()
       const files = output.parts.filter((part): part is FilePart => part.type === "file").map((part) => ({ ...part }))
+      const sh = parseShell(body)
 
       if ((!text || text === "list" || text === "clear") && !files.length) {
         await toast(text === "clear" ? clear(input.sessionID) : summary(input.sessionID), "info", 5000)
         throw new Error(HANDLED)
       }
 
+      if (sh !== undefined && !sh) {
+        await toast("Queue shell command is empty", "error")
+        throw new Error(HANDLED)
+      }
+
+      if (sh !== undefined && files.length) {
+        console.warn("QueuePlugin skipped shell command attachments")
+        await toast("Queued shell commands do not support attachments", "error")
+        throw new Error(HANDLED)
+      }
+
       if (!busy.has(input.sessionID)) {
+        if (sh !== undefined) {
+          await shell(input.sessionID, { text, shell: sh, info: await latest(input.sessionID) })
+          throw new Error(HANDLED)
+        }
+
         const cmd = parseCommand(body)
         if (!cmd) {
           output.parts.length = 0
@@ -195,10 +273,24 @@ export const QueuePlugin: Plugin = async ({ client }) => {
 
       const files = output.parts.filter((part): part is FilePart => part.type === "file")
       const trimmed = body.trim()
+      const sh = parseShell(body)
 
       if ((!trimmed || trimmed === "list" || trimmed === "clear") && !files.length) {
         hide(output.message.id, text)
         await toast(trimmed === "clear" ? clear(sessionID) : summary(sessionID), "info", 5000)
+        return
+      }
+
+      if (sh !== undefined && !sh) {
+        hide(output.message.id, text)
+        await toast("Queue shell command is empty", "error")
+        return
+      }
+
+      if (sh !== undefined && files.length) {
+        console.warn("QueuePlugin skipped shell command attachments")
+        hide(output.message.id, text)
+        await toast("Queued shell commands do not support attachments", "error")
         return
       }
 
@@ -225,7 +317,9 @@ export const QueuePlugin: Plugin = async ({ client }) => {
 
       const info = { agent: output.message.agent, model: { ...output.message.model } }
       const command = parseCommand(body)
-      const item = command
+      const item = sh !== undefined
+        ? { info, text: trimmed, shell: sh }
+        : command
         ? { info, text: trimmed, files, ...command }
         : { info, text: label(body, files.length), parts }
 
