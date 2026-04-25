@@ -7,8 +7,10 @@ const HANDLED = "__QUEUE_HANDLED__"
 
 type InputPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput
 type Model = { providerID: string; modelID: string }
-type Info = { agent: string; model: Model }
+type Meta = { variant?: string; controls?: string[]; fast?: boolean }
 type Run = { agent: string; model?: Model }
+type Info = Run & Meta & { model: Model }
+type Msg = { info: { role: string; agent?: string; mode?: string; model?: Model; providerID?: string; modelID?: string } & Meta }
 
 type Item =
   | { kind: "prompt"; info: Info; text: string; parts: InputPart[] }
@@ -78,28 +80,40 @@ export const QueuePlugin: Plugin = async ({ client }) => {
     return count ? `Cleared ${count} queued item${count === 1 ? "" : "s"}` : "Queue is empty"
   }
 
-  const latest = async (sid: string): Promise<Run> => {
+  const latest = async (sid: string): Promise<Info | undefined> => {
     const result = await client.session.messages({ path: { id: sid }, query: { limit: 100 } }).catch((error) => {
       console.warn("QueuePlugin could not inspect session messages for shell replay", error)
       return []
     })
 
-    for (const msg of [...(Array.isArray(result) ? result : (result.data ?? []))].reverse()) {
-      if (msg.info.role === "user") return { agent: msg.info.agent, model: msg.info.model }
-      if (msg.info.role === "assistant") return { agent: msg.info.mode, model: { providerID: msg.info.providerID, modelID: msg.info.modelID } }
+    for (const msg of [...(Array.isArray(result) ? result : (result.data ?? []))].reverse() as Msg[]) {
+      if (msg.info.role === "user" && msg.info.agent && msg.info.model) return { agent: msg.info.agent, model: msg.info.model, variant: msg.info.variant, controls: msg.info.controls, fast: msg.info.fast }
+      if (msg.info.role === "assistant" && (msg.info.agent || msg.info.mode) && msg.info.providerID && msg.info.modelID) {
+        return { agent: msg.info.agent ?? msg.info.mode!, model: { providerID: msg.info.providerID, modelID: msg.info.modelID }, variant: msg.info.variant, controls: msg.info.controls, fast: msg.info.fast }
+      }
     }
 
+    return undefined
+  }
+
+  const shellRun = async (sid: string): Promise<Run> => {
+    const run = await latest(sid)
+    if (run) return run
     console.warn("QueuePlugin shell replay fell back to the build agent because the session has no message context")
     return { agent: "build" }
   }
 
-  const visible = (sid: string, text: string, info?: Info, parts: FilePartInput[] = []) =>
-    client.session.prompt({
-      path: { id: sid },
-      body: { agent: info?.agent, model: info?.model, noReply: true, parts: [{ type: "text", text }, ...parts] },
-    })
+  const opts = (info: Info) => ({ agent: info.agent, model: info.model, variant: info.variant, controls: info.controls, fast: info.fast })
 
-  const shell = (sid: string, command: string, run: Run) => client.session.shell({ path: { id: sid }, body: { ...run, command } })
+  const prompt = (sid: string, info: Info, parts: InputPart[], noReply?: boolean) =>
+    client.session.prompt({ path: { id: sid }, body: { ...opts(info), noReply, parts } as any })
+
+  const visible = (sid: string, text: string, info?: Info, parts: FilePartInput[] = []) =>
+    info
+      ? prompt(sid, info, [{ type: "text", text }, ...parts], true)
+      : client.session.prompt({ path: { id: sid }, body: { noReply: true, parts: [{ type: "text", text }, ...parts] } })
+
+  const shell = (sid: string, command: string, run: Run) => client.session.shell({ path: { id: sid }, body: { agent: run.agent, model: run.model, command } })
 
   const replay = async (sid: string, item: Item) => {
     if (item.kind === "shell") return shell(sid, item.shell, item.info)
@@ -109,7 +123,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       await client.session.command({
         path: { id: sid },
         body: {
-          agent: item.info.agent,
+          ...opts(item.info),
           model: `${item.info.model.providerID}/${item.info.model.modelID}`,
           command: item.cmd,
           arguments: item.args,
@@ -120,10 +134,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
     }
 
     if (item.parts.length) {
-      return client.session.prompt({
-        path: { id: sid },
-        body: { agent: item.info.agent, model: item.info.model, parts: item.parts.map((part) => ({ ...part, id: undefined })) },
-      })
+      return prompt(sid, item.info, item.parts.map((part) => ({ ...part, id: undefined })))
     }
     console.warn("QueuePlugin skipped queued item without replayable content")
   }
@@ -178,7 +189,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
 
       if (!busy.has(sid)) {
         if (op.kind === "shell") {
-          await shell(sid, op.shell, await latest(sid))
+          await shell(sid, op.shell, await shellRun(sid))
           throw new Error(HANDLED)
         }
 
@@ -196,7 +207,8 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       output.parts.length = 0
       output.parts.push({ type: "text", text: `/queue ${body}` } as any, ...found)
     },
-    "chat.message": async ({ sessionID: sid }, output) => {
+    "chat.message": async (input, output) => {
+      const sid = input.sessionID
       const text = output.parts.find((part): part is TextPart => part.type === "text" && !part.synthetic)
       if (!text) return
 
@@ -225,7 +237,11 @@ export const QueuePlugin: Plugin = async ({ client }) => {
         return
       }
 
-      const info = { agent: output.message.agent, model: { ...output.message.model } }
+      const meta = input as Meta
+      const info = { agent: output.message.agent, model: { ...output.message.model }, variant: meta.variant, controls: meta.controls, fast: meta.fast }
+      const prior = await latest(sid)
+      if (prior) Object.assign(output.message, opts(prior))
+      else console.warn("QueuePlugin could not neutralize queued placeholder metadata because the session has no previous message context")
       const inputParts = () =>
         output.parts.flatMap((part): InputPart[] => {
           if (part.type === "text") return part.id === text.id ? (body ? [{ ...part, text: body }] : []) : [{ ...part }]

@@ -10,6 +10,7 @@ This plugin adds a real `/queue` slash command that keeps the current run focuse
 - Queues slash commands like `/queue /review` and `/queue /commit`
 - Queues shell commands like `/queue !systemctl suspend`
 - Hides queued placeholders from both the UI transcript and the running agent
+- Preserves the selected agent, model, and thinking variant for queued input
 - Replays queued input in order once the session becomes idle
 - Replays queued commands as a visible `/command` message before executing them
 - Replays queued shell commands as shell tool blocks without adding a literal `!command` user message
