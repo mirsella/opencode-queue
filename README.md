@@ -1,26 +1,16 @@
 # opencode-queue
 
-Queue OpenCode input until the current agent run is actually idle.
+[![npm version](https://img.shields.io/npm/v/opencode-queue?color=cb3837)](https://www.npmjs.com/package/opencode-queue)
+[![CI](https://github.com/mirsella/opencode-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/opencode-queue/actions/workflows/ci.yml)
+[![npm downloads](https://img.shields.io/npm/dm/opencode-queue)](https://www.npmjs.com/package/opencode-queue)
 
-This plugin adds a real `/queue` slash command that keeps the current run focused instead of injecting your next message into the still-running loop.
+Queue OpenCode input until the current session is idle.
 
-## What it does
-
-- Queues normal prompts entered while a session is busy
-- Queues prompts with either `/queue prompt` or `prompt /queue`
-- Queues slash commands with either `/queue /review` or `/review /queue`
-- Queues shell commands with `/queue !ls`
-- Hides queued placeholders from both the UI transcript and the running agent
-- Preserves the selected agent, model, and thinking variant for queued input
-- Replays queued input in order once the session becomes idle
-- Replays queued commands as a visible `/command` message before executing them
-- Registers `/queue` as a real OpenCode slash command
-- Shows the current queue with `/queue list`
-- Clears the current queue with `/queue clear`
+`opencode-queue` adds a real `/queue` slash command. It lets you type the next prompt, slash command, or shell command while an agent is still working, without interrupting the current run.
 
 ## Install
 
-Add it to your OpenCode plugin list:
+Add the plugin to your OpenCode config:
 
 ```jsonc
 {
@@ -28,49 +18,67 @@ Add it to your OpenCode plugin list:
 }
 ```
 
-OpenCode installs npm plugins automatically at startup.
+Restart OpenCode after installing. OpenCode installs npm plugins automatically at startup.
 
-Restart OpenCode after installing.
-
-## Usage
-
-While the agent is busy:
+## Quick Examples
 
 ```text
-/queue continue after the current task finishes
+/queue continue after this task
+continue after this task /queue
+
 /queue /review
-/queue /commit
-/queue !ls
-continue after the current task finishes /queue
 /review /queue
+
+/queue !ls
+
 /queue list
 /queue clear
 ```
 
+## Syntax
+
+| Input | What it does |
+| --- | --- |
+| `/queue message` | Queue a normal prompt. |
+| `message /queue` | Queue a normal prompt using trailing syntax. |
+| `/queue /review` | Queue a slash command. |
+| `/review /queue` | Queue a slash command using trailing syntax. |
+| `/queue !ls` | Queue an OpenCode shell block. |
+| `/queue` | Show the current queue. |
+| `/queue list` | Show the current queue. |
+| `/queue clear` | Clear the current queue. |
+
+## Behavior
+
+When the session is busy:
+
+- Queued entries are hidden from the transcript and from the running agent.
+- The current agent run keeps using its original agent, model, and thinking variant.
+- Queued entries replay in order after the session becomes idle.
+- Only one queued entry is sent per idle transition, so queued work runs one item at a time.
+
 When the session is idle:
 
+- `/queue message` sends `message` immediately.
+- `message /queue` sends `message` immediately.
+- `/queue /review` runs `/review` immediately.
+- `/review /queue` runs `/review` immediately.
+- `/queue !ls` runs `ls` immediately as an OpenCode shell block.
+- `/queue` and `/queue list` show the current queue.
+- `/queue clear` clears the current queue.
+
+## Queue Management
+
 ```text
-/queue hello
-/queue /review
-/queue !date
-hello /queue
-/review /queue
 /queue
+/queue list
+/queue clear
 ```
 
-Queued items stay hidden while the current run is still working, then replay automatically when the session becomes idle.
+The queue is in-memory and scoped to the current session.
 
 ## Notes
 
-- This is a `/queue` plugin, not a keyboard shortcut plugin. OpenCode plugins cannot currently register custom TUI keybindings.
-- Idle `/queue some text` is treated like a normal prompt with the `/queue` prefix removed.
-- Idle `some text /queue` and `/command /queue` run immediately with the trailing `/queue` removed.
-- Idle `/queue /command` immediately runs the nested command.
-- Idle `/queue !command` immediately runs the shell command as an OpenCode shell block.
-- `/queue` and `/queue list` show the in-memory queue for the current session.
-- `/queue clear` drops all currently queued items for the current session.
-- Native shell-mode suffixes like `!command /queue` are not supported because OpenCode handles leading `!` before plugin command hooks run.
-
-## License
-
-MIT
+- This plugin registers `/queue` as a real OpenCode slash command.
+- It does not add a keyboard shortcut. OpenCode plugins cannot currently register custom TUI keybindings.
+- Queued placeholders are hidden instead of deleted, then filtered out before messages are sent to the model.
