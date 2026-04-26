@@ -9,18 +9,22 @@ const HANDLED = "__QUEUE_HANDLED__"
 type InputPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput
 type Model = { providerID: string; modelID: string }
 type Meta = { variant?: string; controls?: string[]; fast?: boolean }
+type Run = { agent: string; model?: Model }
 type Info = { agent: string; model: Model } & Meta
 type Msg = { info: { role: string; agent?: string; mode?: string; model?: Model; providerID?: string; modelID?: string } & Meta }
 
 type Item =
   | { kind: "prompt"; info: Info; text: string; parts: InputPart[] }
   | { kind: "command"; info: Info; text: string; cmd: string; args: string; files: FilePartInput[] }
+  | { kind: "shell"; info: Info; text: string; shell: string }
 
 type Op =
   | { kind: "list" }
   | { kind: "clear" }
+  | { kind: "invalid"; text: string }
   | { kind: "prompt"; text: string; body: string }
   | { kind: "command"; text: string; cmd: string; args: string }
+  | { kind: "shell"; text: string; shell: string }
 
 const label = (body: string, files: number) => {
   const text = body.trim() || `${files} attachment${files === 1 ? "" : "s"}`
@@ -32,6 +36,13 @@ const parse = (body: string, files = 0): Op => {
   if (!files) {
     if (!text || text === "list") return { kind: "list" }
     if (text === "clear") return { kind: "clear" }
+  }
+
+  if (text.startsWith("!")) {
+    const shell = text.slice(1).trim()
+    if (!shell) return { kind: "invalid", text: "Queue shell command is empty" }
+    if (files) return { kind: "invalid", text: "Queued shell commands do not support attachments" }
+    return { kind: "shell", text, shell }
   }
 
   const match = text.match(CMD)
@@ -88,11 +99,21 @@ export const QueuePlugin: Plugin = async ({ client }) => {
     return undefined
   }
 
+  const run = async (sid: string): Promise<Run> => {
+    const info = await latest(sid)
+    if (info) return info
+    console.warn("QueuePlugin shell replay fell back to the build agent because the session has no message context")
+    return { agent: "build" }
+  }
+
   const opts = (info: Info) => ({ agent: info.agent, model: info.model, variant: info.variant, controls: info.controls, fast: info.fast })
 
   const prompt = (sid: string, info: Info, parts: InputPart[], noReply?: boolean) => client.session.prompt({ path: { id: sid }, body: { ...opts(info), noReply, parts } as any })
+  const shell = (sid: string, command: string, info: Run) => client.session.shell({ path: { id: sid }, body: { agent: info.agent, model: info.model, command } })
 
   const replay = async (sid: string, item: Item) => {
+    if (item.kind === "shell") return shell(sid, item.shell, item.info)
+
     if (item.kind === "command") {
       await prompt(sid, item.info, [{ type: "text", text: item.text }, ...item.files], true)
       await client.session.command({
@@ -170,8 +191,14 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       const op = parse(body, parts.length)
 
       if (op.kind === "list" || op.kind === "clear") return stop(manage(sid, op))
+      if (op.kind === "invalid") return stop(op.text, "error")
 
       if (!busy.has(sid)) {
+        if (op.kind === "shell") {
+          await shell(sid, op.shell, await run(sid))
+          throw new Error(HANDLED)
+        }
+
         if (op.kind === "command") {
           await client.session.prompt({ path: { id: sid }, body: { noReply: true, parts: [{ type: "text", text: op.text }, ...parts] } })
           await client.session.command({ path: { id: sid }, body: { command: op.cmd, arguments: op.args, parts } as any })
@@ -203,8 +230,19 @@ export const QueuePlugin: Plugin = async ({ client }) => {
         return
       }
 
+      if (op.kind === "invalid") {
+        hide(output.message.id, text)
+        await toast(op.text, "error", 5000)
+        return
+      }
+
       if (!busy.has(sid)) {
         if (op.kind === "command") return
+        if (op.kind === "shell") {
+          hide(output.message.id, text)
+          await shell(sid, op.shell, { agent: output.message.agent, model: output.message.model })
+          return
+        }
         text.text = body
         return
       }
@@ -221,7 +259,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
           console.warn("QueuePlugin skipped unexpected part", part.type)
           return []
         })
-      const item: Item = op.kind === "command" ? { ...op, info, files: parts } : { ...op, info, parts: inputParts() }
+      const item: Item = op.kind === "shell" ? { ...op, info } : op.kind === "command" ? { ...op, info, files: parts } : { ...op, info, parts: inputParts() }
 
       queue.set(sid, [...(queue.get(sid) ?? []), item])
       hide(output.message.id, text)

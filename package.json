@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-queue",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "type": "module",
   "description": "Queue OpenCode prompts and slash commands until the agent is idle",
   "main": "./index.ts",
