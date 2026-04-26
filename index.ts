@@ -141,7 +141,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
 
     flushing.add(sid)
     try {
-      while (list.length) await replay(sid, list.shift()!)
+      await replay(sid, list.shift()!)
     } catch (error) {
       console.error("QueuePlugin failed to flush queued input", error)
       await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
