@@ -12,6 +12,8 @@ type Meta = { variant?: string; controls?: string[]; fast?: boolean }
 type Run = { agent: string; model?: Model }
 type Info = { agent: string; model: Model } & Meta
 type Msg = { info: { role: string; agent?: string; mode?: string; model?: Model; providerID?: string; modelID?: string } & Meta }
+type Ask = { type: string; properties: { id: string; sessionID: string; questions: { question: string; header: string }[] } }
+type Post = (input: { url: string; path?: Record<string, string>; body?: unknown; headers?: Record<string, string> }) => Promise<{ response?: Response; error?: unknown } | undefined>
 
 type Item =
   | { kind: "prompt"; info: Info; text: string; parts: InputPart[] }
@@ -53,12 +55,18 @@ const parse = (body: string, files = 0): Op => {
 const trailing = (text: string) => (text.trim() === "/queue" ? "" : text.match(SUFFIX)?.[1])
 const strip = (text: string) => trailing(text) ?? text
 const queued = (text: string) => text.match(QUEUE)?.[1] ?? trailing(text)
+const plan = (event: unknown): event is Ask => {
+  if (typeof event !== "object" || !event || !("type" in event) || event.type !== "question.asked") return false
+  const question = (event as Ask).properties?.questions?.[0]
+  return question?.header === "Build Agent" && question.question.includes("switch to the build agent")
+}
 
 export const QueuePlugin: Plugin = async ({ client }) => {
   const queue = new Map<string, Item[]>()
   const hidden = new Set<string>()
   const busy = new Set<string>()
-  const flushing = new Set<string>()
+  const active = new Set<string>()
+  const post = (client as unknown as { _client?: { post?: Post } })._client?.post
 
   const toast = (message: string, variant: "info" | "error", duration = 2500) =>
     client.tui.showToast({ body: { message, variant, duration } }).catch(() => undefined)
@@ -66,6 +74,19 @@ export const QueuePlugin: Plugin = async ({ client }) => {
   const stop = async (message: string, variant: "info" | "error" = "info", duration = 5000): Promise<never> => {
     await toast(message, variant, duration)
     throw new Error(HANDLED)
+  }
+
+  const no = async (id: string) => {
+    if (!post) {
+      console.warn("QueuePlugin cannot answer plan prompt because the SDK client has no internal request method")
+      return
+    }
+
+    const result = await post({ url: "/question/{requestID}/reply", path: { requestID: id }, body: { answers: [["No"]] } }).catch((error) => {
+      console.warn("QueuePlugin failed to answer plan prompt", error)
+      return undefined
+    })
+    if (!result?.response?.ok) console.warn("QueuePlugin failed to answer plan prompt", result?.error ?? result?.response?.status)
   }
 
   const hide = (id: string, part: TextPart) => {
@@ -89,14 +110,13 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       return []
     })
 
-    for (const msg of [...(Array.isArray(result) ? result : (result.data ?? []))].reverse() as Msg[]) {
-      if (msg.info.role === "user" && msg.info.agent && msg.info.model) return { agent: msg.info.agent, model: msg.info.model, variant: msg.info.variant, controls: msg.info.controls, fast: msg.info.fast }
+    return ([...(Array.isArray(result) ? result : (result.data ?? []))].reverse() as Msg[]).flatMap((msg): Info[] => {
+      if (msg.info.role === "user" && msg.info.agent && msg.info.model) return [{ agent: msg.info.agent, model: msg.info.model, variant: msg.info.variant, controls: msg.info.controls, fast: msg.info.fast }]
       if (msg.info.role === "assistant" && (msg.info.agent || msg.info.mode) && msg.info.providerID && msg.info.modelID) {
-        return { agent: msg.info.agent ?? msg.info.mode!, model: { providerID: msg.info.providerID, modelID: msg.info.modelID }, variant: msg.info.variant, controls: msg.info.controls, fast: msg.info.fast }
+        return [{ agent: msg.info.agent ?? msg.info.mode!, model: { providerID: msg.info.providerID, modelID: msg.info.modelID }, variant: msg.info.variant, controls: msg.info.controls, fast: msg.info.fast }]
       }
-    }
-
-    return undefined
+      return []
+    })[0]
   }
 
   const run = async (sid: string): Promise<Run> => {
@@ -137,19 +157,18 @@ export const QueuePlugin: Plugin = async ({ client }) => {
 
   const flush = (sid: string) => {
     const list = queue.get(sid)
-    if (flushing.has(sid) || !list?.length) return
+    if (!list?.length) return
     const item = list.shift()
     if (!item) return
+    if (!list.length) queue.delete(sid)
 
-    if (list.length) queue.set(sid, list)
-    else queue.delete(sid)
-
-    flushing.add(sid)
+    active.add(sid)
     void replay(sid, item).catch(async (error) => {
       console.error("QueuePlugin failed to flush queued input", error)
       await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
+    }).finally(() => {
+      active.delete(sid)
     })
-    flushing.delete(sid)
   }
 
   return {
@@ -158,6 +177,14 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       cfg.command.queue = { template: "", description: "Queue input until the session is idle" }
     },
     event: async ({ event }) => {
+      if (plan(event)) {
+        const sid = event.properties.sessionID
+        if (!active.has(sid) && !queue.get(sid)?.length) return
+        await no(event.properties.id)
+        await toast("Declined plan approval to continue queued work", "info")
+        return
+      }
+
       if (event.type !== "session.status") return
 
       const sid = event.properties.sessionID
@@ -183,8 +210,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
           return
         }
 
-        output.parts.length = 0
-        output.parts.push({ type: "text", text: `/queue /${input.command}${args.trim() ? ` ${args.trim()}` : ""}` } as any, ...parts)
+        output.parts.splice(0, output.parts.length, { type: "text", text: `/queue /${input.command}${args.trim() ? ` ${args.trim()}` : ""}` } as any, ...parts)
         return
       }
 
@@ -205,13 +231,11 @@ export const QueuePlugin: Plugin = async ({ client }) => {
           throw new Error(HANDLED)
         }
 
-        output.parts.length = 0
-        output.parts.push({ type: "text", text: op.body } as any, ...parts)
+        output.parts.splice(0, output.parts.length, { type: "text", text: op.body } as any, ...parts)
         return
       }
 
-      output.parts.length = 0
-      output.parts.push({ type: "text", text: `/queue ${body}` } as any, ...parts)
+      output.parts.splice(0, output.parts.length, { type: "text", text: `/queue ${body}` } as any, ...parts)
     },
     "chat.message": async (input, output) => {
       const sid = input.sessionID
@@ -252,14 +276,19 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       const prior = await latest(sid)
       if (prior) Object.assign(output.message, opts(prior))
       else console.warn("QueuePlugin could not neutralize queued placeholder metadata because the session has no previous message context")
-      const inputParts = () =>
-        output.parts.flatMap((part): InputPart[] => {
-          if (part.type === "text") return part.id === text.id ? (body ? [{ ...part, text: body }] : []) : [{ ...part }]
-          if (part.type === "file" || part.type === "agent" || part.type === "subtask") return [{ ...part }]
-          console.warn("QueuePlugin skipped unexpected part", part.type)
-          return []
-        })
-      const item: Item = op.kind === "shell" ? { ...op, info } : op.kind === "command" ? { ...op, info, files: parts } : { ...op, info, parts: inputParts() }
+      const item: Item =
+        op.kind === "shell" ? { ...op, info } :
+        op.kind === "command" ? { ...op, info, files: parts } :
+        {
+          ...op,
+          info,
+          parts: output.parts.flatMap((part): InputPart[] => {
+            if (part.type === "text") return part.id === text.id ? (body ? [{ ...part, text: body }] : []) : [{ ...part }]
+            if (part.type === "file" || part.type === "agent" || part.type === "subtask") return [{ ...part }]
+            console.warn("QueuePlugin skipped unexpected part", part.type)
+            return []
+          }),
+        }
 
       queue.set(sid, [...(queue.get(sid) ?? []), item])
       hide(output.message.id, text)

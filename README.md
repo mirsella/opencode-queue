@@ -82,3 +82,4 @@ The queue is in-memory and scoped to the current session.
 - This plugin registers `/queue` as a real OpenCode slash command.
 - It does not add a keyboard shortcut. OpenCode plugins cannot currently register custom TUI keybindings.
 - Queued placeholders are hidden instead of deleted, then filtered out before messages are sent to the model.
+- If plan mode asks to switch to the build agent while more queued work is waiting, the plugin answers `No` so the queue can continue.
