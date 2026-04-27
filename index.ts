@@ -135,21 +135,21 @@ export const QueuePlugin: Plugin = async ({ client }) => {
     console.warn("QueuePlugin skipped queued item without replayable content")
   }
 
-  const flush = async (sid: string) => {
+  const flush = (sid: string) => {
     const list = queue.get(sid)
     if (flushing.has(sid) || !list?.length) return
+    const item = list.shift()
+    if (!item) return
+
+    if (list.length) queue.set(sid, list)
+    else queue.delete(sid)
 
     flushing.add(sid)
-    try {
-      await replay(sid, list.shift()!)
-    } catch (error) {
+    void replay(sid, item).catch(async (error) => {
       console.error("QueuePlugin failed to flush queued input", error)
       await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
-    } finally {
-      if (list.length) queue.set(sid, list)
-      else queue.delete(sid)
-      flushing.delete(sid)
-    }
+    })
+    flushing.delete(sid)
   }
 
   return {
@@ -167,7 +167,7 @@ export const QueuePlugin: Plugin = async ({ client }) => {
       }
 
       busy.delete(sid)
-      await flush(sid)
+      flush(sid)
     },
     "command.execute.before": async (input, output) => {
       const sid = input.sessionID
