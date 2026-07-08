@@ -292,27 +292,30 @@ export const QueuePlugin: Plugin = async ({ client, directory }) => {
     const items = current.items.splice(0, count)
     if (!items.length) return { sent: 0, failed: 0 }
 
-    let failed = 0
-    const retry: Item[] = []
+    current.activity = { kind: "sending", idle: false }
+    let retry: Item[] = []
     try {
-      for (const item of items) {
-        current.activity = { kind: "sending", idle: false }
-        try {
-          await replay(sid, item)
-        } catch (error) {
-          failed++
-          retry.push(item)
-          console.error("QueuePlugin failed to flush queued input", error)
-          await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
-        }
-      }
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            await replay(sid, item)
+            return { item, failed: false }
+          } catch (error) {
+            console.error("QueuePlugin failed to flush queued input", error)
+            await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
+            return { item, failed: true }
+          }
+        }),
+      )
+      retry = results.flatMap((result) => (result.failed ? [result.item] : []))
     } finally {
       if (retry.length) current.items.unshift(...retry)
+      const failed = retry.length
       const replayCompleted = current.activity.kind === "sending" && current.activity.idle
       if (replayCompleted) settle(sid, count === 1 && failed === 0)
       else current.activity = failed ? { kind: "idle" } : { kind: "busy" }
     }
-    return { sent: items.length - failed, failed }
+    return { sent: items.length - retry.length, failed: retry.length }
   }
 
   const manage = async (sid: string, op: ControlOp) => {

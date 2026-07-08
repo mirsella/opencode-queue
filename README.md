@@ -85,7 +85,7 @@ When the session is busy:
 - Only one queued entry is sent per idle transition, so queued work runs one item at a time.
 - Queued entries are kept in place after an error or abort.
 - `/queue stop` pauses automatic replay without clearing queued entries, and `/queue start` resumes it.
-- `/queue flush` sends all queued entries immediately, even before the session is idle.
+- `/queue flush` sends all queued entries immediately in one batch, even before the session is idle.
 
 When the session is idle:
 
@@ -97,7 +97,7 @@ When the session is idle:
 - `/queue !ls` runs `ls` immediately as an OpenCode shell block.
 - `/queue` and `/queue list` show the current queue.
 - `/queue stop` pauses automatic replay, and `/queue start` resumes it.
-- `/queue flush` sends all queued entries immediately.
+- `/queue flush` sends all queued entries immediately in one batch.
 - `/queue clear` clears the current queue, and `/queue clear 1` clears a specific queued item.
 
 ## Queue Management
