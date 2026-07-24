@@ -83,7 +83,7 @@ When the session is busy:
 - Queued entries replay in order after the session completes normally and becomes idle.
 - `/queue front ...` puts an entry before the existing queued entries.
 - Only one queued entry is sent per idle transition, so queued work runs one item at a time.
-- Queued entries are kept in place after an error or abort.
+- Queued entries are kept in place after an error, abort, crash, or restart.
 - `/queue stop` pauses automatic replay without clearing queued entries, and `/queue start` resumes it.
 - `/queue flush` sends all queued entries immediately in one batch, even before the session is idle.
 
@@ -113,7 +113,7 @@ When the session is idle:
 /queue clear 2 3
 ```
 
-The queue is in-memory and scoped to the current session.
+Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored after OpenCode restarts or crashes. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
 
 ## Notes
 

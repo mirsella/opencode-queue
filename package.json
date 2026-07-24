@@ -29,12 +29,13 @@
     ".": "./index.ts"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.17.0"
   },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
+    "test": "tsx --test index.test.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -43,6 +44,8 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.14.37",
     "@opencode-ai/sdk": "^1.14.37",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
     "typescript": "^6.0.3"
   },
   "overrides": {

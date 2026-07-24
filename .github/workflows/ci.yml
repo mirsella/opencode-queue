@@ -12,9 +12,10 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 20.17.0
           cache: npm
 
       - run: npm ci
+      - run: npm test
       - run: npm run typecheck
       - run: npm pack --dry-run
