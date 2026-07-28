@@ -215,7 +215,9 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         const validHidden = Array.isArray(value.hidden) && value.hidden.every((id) => typeof id === "string")
         if (!validHidden) console.warn("QueuePlugin skipped invalid stored hidden messages", sid)
         const hidden = new Set(validHidden ? (value.hidden as string[]) : [])
-        if (items.length || value.stopped || hidden.size) sessions.set(sid, { items, activity: { kind: "idle" }, stopped: value.stopped, failed: false, hidden })
+        const stopped = value.stopped || items.length > 0
+        if (items.length && !value.stopped) console.warn("QueuePlugin paused restored queued input to prevent duplicate replay after a restart", sid)
+        if (items.length || stopped || hidden.size) sessions.set(sid, { items, activity: { kind: "idle" }, stopped, failed: false, hidden })
       }
     }
   } catch (error) {

@@ -69,14 +69,16 @@ isolated("restores queued items and stopped state after restart", async () => {
   assert.equal(await list(third), "Queue is empty\nQueue is stopped")
 })
 
-isolated("automatically resumes an unpaused queue after restart", async () => {
+isolated("pauses restored input until explicitly restarted", async () => {
   const first = await plugin()
   await busy(first)
   await chat(first, "queued", "/queue resume after restart")
 
   let replay
   const replayed = new Promise((resolve) => (replay = resolve))
-  await plugin({ prompt: async ({ body }) => replay(body.parts[0].text) })
+  const second = await plugin({ prompt: async ({ body }) => replay(body.parts[0].text) })
+  assert.equal(await list(second), "1. resume after restart\nQueue is stopped")
+  await chat(second, "start", "/queue start")
   assert.equal(await replayed, "resume after restart")
 })
 
