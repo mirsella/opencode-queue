@@ -113,7 +113,7 @@ When the session is idle:
 /queue clear 2 3
 ```
 
-Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored after OpenCode restarts or crashes. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting, so restored queues stay paused until explicitly started.
+Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
 
 ## Notes
 
