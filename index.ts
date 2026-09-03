@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { AgentPartInput, FilePart, FilePartInput, SubtaskPartInput, TextPart, TextPartInput } from "@opencode-ai/sdk"
 import { HttpServerResponse } from "effect/unstable/http"
 import { createHash, randomUUID } from "node:crypto"
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -43,8 +43,8 @@ type ControlOp =
 
 type Activity = { kind: "idle" } | { kind: "restored" } | { kind: "busy" } | { kind: "sending"; idle: boolean; items: Item[] }
 type State = { items: Item[]; activity: Activity; stopped: boolean; failed: boolean; hidden: Set<string> }
-type Draft = Pick<State, "items" | "stopped" | "hidden"> & { always: boolean }
-type Store = { version: 1; projectID: string; always: boolean; sessions: Record<string, { items: Item[]; stopped: boolean; hidden: string[] }> }
+type Draft = Pick<State, "items" | "stopped" | "hidden">
+type Store = { version: 1; projectID: string; sessions: Record<string, { items: Item[]; stopped: boolean; hidden: string[] }> }
 type Placeholder = { id: string; part: TextPart }
 
 type Op =
@@ -197,6 +197,17 @@ const dataHome = () => {
   return join(homedir(), ".local", "share")
 }
 
+const writeJson = async (path: string, value: unknown, commit = rename) => {
+  await mkdir(dirname(path), { recursive: true })
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+    await commit(temporary, path)
+  } finally {
+    await rm(temporary, { force: true }).catch((error) => console.warn("QueuePlugin failed to remove temporary storage", error))
+  }
+}
+
 export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const sessions = new Map<string, State>()
   const deleted = new Set<string>()
@@ -204,17 +215,28 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const internalCommands: { sid: string; command: string; args: string; used: boolean }[] = []
   const origin = randomUUID()
   const post = (client as unknown as { _client?: { post?: Post } })._client?.post
-  const path = join(dataHome(), "opencode", "opencode-queue", `${createHash("sha256").update(project.id).digest("hex")}.json`)
-  let alwaysQueue = false
+  const root = join(dataHome(), "opencode", "opencode-queue")
+  const path = join(root, `${createHash("sha256").update(project.id).digest("hex")}.json`)
+  const settingsPath = join(root, "settings.json")
   let writes = Promise.resolve()
+
+  const readAlways = async () => {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(settingsPath, "utf8"))
+      if (record(parsed) && typeof parsed.always === "boolean") return parsed.always
+      console.warn("QueuePlugin ignored invalid global settings", settingsPath)
+    } catch (error) {
+      if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load global settings", error)
+    }
+    return false
+  }
+  let legacyAlways = false
 
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
     if (!record(parsed) || parsed.version !== 1 || parsed.projectID !== project.id || !record(parsed.sessions)) {
       console.warn("QueuePlugin ignored invalid queue storage", path)
     } else {
-      if (typeof parsed.always === "boolean") alwaysQueue = parsed.always
-      else if (parsed.always !== undefined) console.warn("QueuePlugin ignored invalid always queue setting", path)
       for (const [sid, value] of Object.entries(parsed.sessions)) {
         if (!record(value) || typeof value.stopped !== "boolean" || !Array.isArray(value.items)) {
           console.warn("QueuePlugin skipped invalid stored session", sid)
@@ -228,28 +250,27 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         const activity: Activity = { kind: items.length && !value.stopped ? "restored" : "idle" }
         if (items.length || value.stopped || hidden.size) sessions.set(sid, { items, activity, stopped: value.stopped, failed: false, hidden })
       }
+      legacyAlways = parsed.always === true
     }
   } catch (error) {
     if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load queue storage", error)
   }
-
+  if (legacyAlways) {
+    try {
+      await writeJson(settingsPath, { always: true }, link)
+    } catch (error) {
+      if (!record(error) || error.code !== "EEXIST") throw error
+    }
+  }
   const save = async (sid?: string, draft?: Draft) => {
-    const stored: Store = { version: 1, projectID: project.id, always: draft?.always ?? alwaysQueue, sessions: {} }
+    const stored: Store = { version: 1, projectID: project.id, sessions: {} }
     for (const [id, current] of sessions) {
       if (deleted.has(id) || (id === sid && !draft)) continue
       const durable = id === sid ? draft! : current
       const items = current.activity.kind === "sending" ? [...current.activity.items, ...durable.items] : durable.items
       if (items.length || durable.stopped || durable.hidden.size) stored.sessions[id] = { items, stopped: durable.stopped, hidden: [...durable.hidden] }
     }
-    const contents = `${JSON.stringify(stored, null, 2)}\n`
-    await mkdir(dirname(path), { recursive: true })
-    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
-    try {
-      await writeFile(temporary, contents, { mode: 0o600 })
-      await rename(temporary, path)
-    } finally {
-      await rm(temporary, { force: true }).catch((error) => console.warn("QueuePlugin failed to remove temporary queue storage", error))
-    }
+    await writeJson(path, stored)
   }
 
   const serialize = <T>(action: () => Promise<T>) => {
@@ -267,7 +288,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     return current
   }
 
-  const automaticallyQueue = (sid: string) => alwaysQueue && shouldQueue(sessions.get(sid))
+  const automaticallyQueue = async (sid: string) => shouldQueue(sessions.get(sid)) && (await readAlways())
 
   const store = async (sid: string, current: State, draft: Draft, placeholder?: Placeholder) => {
     try {
@@ -279,7 +300,6 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     current.items.splice(0, current.items.length, ...draft.items)
     current.stopped = draft.stopped
     current.hidden = draft.hidden
-    alwaysQueue = draft.always
     if (placeholder) Object.assign(placeholder.part, { text: "", synthetic: true, ignored: true })
   }
 
@@ -287,7 +307,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     serialize(async () => {
       if (deleted.has(sid)) throw new Error(`QueuePlugin cannot persist queue state for deleted session ${sid}`)
       const current = state(sid)
-      const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden), always: alwaysQueue }
+      const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden) }
       if (placeholder) draft.hidden.add(placeholder.id)
       const value = mutate(draft)
       await store(sid, current, draft, placeholder)
@@ -451,7 +471,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
       const items = current.items.slice(0, count)
       if (placeholder) {
-        const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden).add(placeholder.id), always: alwaysQueue }
+        const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden).add(placeholder.id) }
         await store(sid, current, draft, placeholder)
         if (deleted.has(sid)) return undefined
       }
@@ -519,6 +539,16 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       return result.failed ? `${message}; ${result.failed} failed` : message
     }
 
+    if (op.kind === "always") {
+      const enabled = await serialize(async () => {
+        if (op.enabled === undefined) return readAlways()
+        await writeJson(settingsPath, { always: op.enabled })
+        return op.enabled
+      })
+      if (placeholder) await persist(sid, placeholder, () => undefined)
+      return `Always queue is ${enabled ? "on" : "off"} globally`
+    }
+
     const message = await persist(sid, placeholder, (draft) => {
       switch (op.kind) {
         case "list": {
@@ -533,9 +563,6 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         case "start":
           draft.stopped = false
           return "Queue started"
-        case "always":
-          if (op.enabled !== undefined) draft.always = op.enabled
-          return `Always queue is ${draft.always ? "on" : "off"} for this project`
       }
     })
     if (op.kind === "start") {
@@ -618,7 +645,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       }
 
       if (!isQueue(input.command)) {
-        const queued = parseSuffix(body) ?? (automaticallyQueue(sid) ? { body } : undefined)
+        const queued = parseSuffix(body) ?? ((await automaticallyQueue(sid)) ? { body } : undefined)
         if (!queued) return
 
         if (!shouldQueue(sessions.get(sid))) {
@@ -672,7 +699,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       const text = output.parts.find((part): part is TextPart => part.type === "text" && !part.synthetic)
       if (!text) return
 
-      const request = parseInput(text.text) ?? (automaticallyQueue(sid) ? { body: text.text } : undefined)
+      const request = parseInput(text.text) ?? ((await automaticallyQueue(sid)) ? { body: text.text } : undefined)
       if (!request) return
 
       const current = state(sid)

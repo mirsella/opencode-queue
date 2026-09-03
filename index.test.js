@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -12,7 +13,7 @@ const output = (id, text) => ({
   parts: [{ id: `${id}-part`, type: "text", text }],
 })
 
-const plugin = async (session = {}) => {
+const plugin = async (session = {}, project = "project") => {
   const toasts = []
   const client = {
     tui: {
@@ -28,7 +29,7 @@ const plugin = async (session = {}) => {
       ...session,
     },
   }
-  const hooks = await QueuePlugin({ client, directory: "/project", project: { id: "project" } })
+  const hooks = await QueuePlugin({ client, directory: `/${project}`, project: { id: project } })
   hooks.toasts = toasts
   return hooks
 }
@@ -70,12 +71,12 @@ isolated("restores queued items and stopped state after restart", async () => {
   assert.equal(await list(third), "Queue is empty\nQueue is stopped")
 })
 
-isolated("persists always mode and bypasses it with now", async () => {
-  let hooks = await plugin()
-  await chat(hooks, "always-on", "/queue always on")
-  hooks = await plugin()
+isolated("persists global always mode and bypasses it with now", async () => {
+  const first = await plugin()
+  await chat(first, "always-on", "/queue always on")
+  const hooks = await plugin({}, "other-project")
   await chat(hooks, "always-status", "/queue always")
-  assert.equal(hooks.toasts.at(-1), "Always queue is on for this project")
+  assert.equal(hooks.toasts.at(-1), "Always queue is on globally")
   await busy(hooks)
   await chat(hooks, "plain", "queue without the command")
 
@@ -94,11 +95,20 @@ isolated("persists always mode and bypasses it with now", async () => {
 
   await chat(hooks, "clear", "/queue clear")
   await chat(hooks, "always-off", "/queue always off")
-  hooks = await plugin()
-  await busy(hooks)
+  await busy(first)
   const direct = output("direct", "send immediately")
-  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, direct)
+  await first["chat.message"]({ sessionID: "session", agent: "build", model }, direct)
   assert.equal(direct.parts[0].text, "send immediately")
+})
+
+isolated("migrates project always mode globally", async (data) => {
+  const project = "legacy"
+  const root = join(data, "opencode", "opencode-queue")
+  await mkdir(root, { recursive: true })
+  await writeFile(join(root, `${createHash("sha256").update(project).digest("hex")}.json`), JSON.stringify({ version: 1, projectID: project, always: true, sessions: {} }))
+  const hooks = await plugin({}, project)
+  await chat(hooks, "always-status", "/queue always")
+  assert.equal(hooks.toasts.at(-1), "Always queue is on globally")
 })
 
 isolated("accepts q as a queue alias", async () => {

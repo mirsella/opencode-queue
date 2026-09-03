@@ -72,9 +72,9 @@ do this next /queue front
 | `/queue list` | Show the current queue. |
 | `/queue stop` | Pause automatic sending of queued entries. |
 | `/queue start` | Resume automatic sending of queued entries. |
-| `/queue always` | Show whether automatic queueing is enabled for this project. |
-| `/queue always on` | Automatically queue plain input while the session is busy. |
-| `/queue always off` | Require `/queue` again. |
+| `/queue always` | Show whether automatic queueing is enabled globally. |
+| `/queue always on` | Enable automatic queueing in every project. |
+| `/queue always off` | Disable automatic queueing in every project. |
 | `/queue flush` | Send all queued entries immediately. |
 | `/queue clear` | Clear the current queue. |
 | `/queue clear 1` | Clear item 1 from the current queue. |
@@ -109,7 +109,7 @@ When the session is idle:
 - `/queue flush` sends all queued entries immediately in one batch.
 - `/queue clear` clears the current queue, and `/queue clear 1` clears a specific queued item.
 
-Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. The `always` setting applies to the whole project and is stored with its queues. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. The `always` setting applies to every OpenCode project. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
 
 ## Notes
 
