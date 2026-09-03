@@ -6,8 +6,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
-const QUEUE = /^\/queue(?:\s+([\s\S]*))?$/
-const SUFFIX = /^([\s\S]*?)\s+\/queue(?:\s+(front))?\s*$/
+const SUFFIX = /^(?:([\s\S]*?)\s+)?\/(\S+)(?:\s+(front))?\s*$/
 const CMD = /^\/(\S+)(?:\s+([\s\S]*))?$/
 const ITEM_NUMBER = /^[1-9]\d*$/
 const TUI_COMPACT = "session_compact"
@@ -52,6 +51,8 @@ type Op =
   | ControlOp
   | { kind: "invalid"; message: string }
   | (EntryOp & { front: boolean })
+
+const isQueue = (command: string) => command === "q" || command === "queue"
 
 const parsePrefix = (body: string): QueueInput => {
   const match = body.trim().match(/^(front|now)(?:\s+([\s\S]*))?$/)
@@ -109,17 +110,13 @@ const parse = (input: QueueInput, files = 0): Op => {
 }
 
 const parseSuffix = (text: string): QueueInput | undefined => {
-  const trimmed = text.trim()
-  if (trimmed === "/queue") return { body: "" }
-  if (trimmed === "/queue front") return { body: "", modifier: "front" }
-
   const match = text.match(SUFFIX)
-  return match ? { body: match[1], modifier: match[2] ? "front" : undefined } : undefined
+  return match && isQueue(match[2]) ? { body: match[1] ?? "", modifier: match[3] ? "front" : undefined } : undefined
 }
 const stripSuffix = (text: string) => parseSuffix(text)?.body ?? text
 const parseInput = (text: string): QueueInput | undefined => {
-  const prefix = text.match(QUEUE)
-  return prefix ? parsePrefix(prefix[1] ?? "") : parseSuffix(text)
+  const prefix = text.match(CMD)
+  return prefix && isQueue(prefix[1]) ? parsePrefix(prefix[2] ?? "") : parseSuffix(text)
 }
 const control = (op: Op): op is ControlOp => {
   switch (op.kind) {
@@ -619,7 +616,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         return
       }
 
-      if (input.command !== "queue") {
+      if (!isQueue(input.command)) {
         const queued = parseSuffix(body) ?? (automaticallyQueue(sid) ? { body } : undefined)
         if (!queued) return
 

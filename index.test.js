@@ -78,7 +78,7 @@ isolated("persists always mode and bypasses it with now", async () => {
   await chat(hooks, "plain", "queue without the command")
 
   const immediate = output("now", "")
-  await hooks["command.execute.before"]({ sessionID: "session", command: "queue", arguments: "now send immediately" }, immediate)
+  await hooks["command.execute.before"]({ sessionID: "session", command: "q", arguments: "now send immediately" }, immediate)
   await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, immediate)
   assert.equal(immediate.parts[0].text, "send immediately")
   assert.equal(await list(hooks), "1. queue without the command")
@@ -97,6 +97,14 @@ isolated("persists always mode and bypasses it with now", async () => {
   const direct = output("direct", "send immediately")
   await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, direct)
   assert.equal(direct.parts[0].text, "send immediately")
+})
+
+isolated("accepts q as a queue alias", async () => {
+  const hooks = await plugin()
+  await busy(hooks)
+  await chat(hooks, "last", "/q last")
+  await chat(hooks, "first", "first /q front")
+  assert.equal(await list(hooks), "1. first\n2. last")
 })
 
 isolated("does not requeue internal replays in always mode", async () => {

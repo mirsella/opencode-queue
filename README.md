@@ -6,7 +6,7 @@
 
 Queue OpenCode input until the current session is idle.
 
-`opencode-queue` adds a real `/queue` slash command. It lets you type the next prompt, slash command, or shell command while an agent is still working, without interrupting the current run.
+`opencode-queue` adds `/queue` and its shorter `/q` alias. It lets you type the next prompt, slash command, or shell command while an agent is still working, without interrupting the current run.
 
 ## Install
 
@@ -23,7 +23,7 @@ Restart OpenCode after installing. OpenCode installs npm plugins automatically a
 ## Quick Examples
 
 ```text
-/queue continue after this task
+/q continue after this task
 continue after this task /queue
 /queue front do this next
 do this next /queue front
@@ -50,6 +50,8 @@ do this next /queue front
 ```
 
 ## Syntax
+
+`/q` is accepted anywhere `/queue` is shown.
 
 | Input | What it does |
 | --- | --- |
@@ -110,7 +112,6 @@ Queues are scoped to the current project and session. They are stored in OpenCod
 
 ## Notes
 
-- This plugin registers `/queue` as a real OpenCode slash command.
 - It does not add a keyboard shortcut. OpenCode plugins cannot currently register custom TUI keybindings.
 - Queued placeholders are hidden instead of deleted, then filtered out before messages are sent to the model.
 - If plan mode asks to switch to the build agent while more queued work is waiting, the plugin answers `No` so the queue can continue.
