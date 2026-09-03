@@ -12,7 +12,7 @@ const output = (id, text) => ({
   parts: [{ id: `${id}-part`, type: "text", text }],
 })
 
-const plugin = async ({ prompt = async () => undefined, messages = async () => ({ data: [] }) } = {}) => {
+const plugin = async (session = {}) => {
   const toasts = []
   const client = {
     tui: {
@@ -20,11 +20,12 @@ const plugin = async ({ prompt = async () => undefined, messages = async () => (
       executeCommand: async () => undefined,
     },
     session: {
-      messages,
-      prompt,
+      messages: async () => ({ data: [] }),
+      prompt: async () => undefined,
       shell: async () => undefined,
       command: async () => undefined,
       summarize: async () => undefined,
+      ...session,
     },
   }
   const hooks = await QueuePlugin({ client, directory: "/project", project: { id: "project" } })
@@ -69,6 +70,63 @@ isolated("restores queued items and stopped state after restart", async () => {
   assert.equal(await list(third), "Queue is empty\nQueue is stopped")
 })
 
+isolated("persists always mode and bypasses it with now", async () => {
+  let hooks = await plugin()
+  await chat(hooks, "always-on", "/queue always on")
+  hooks = await plugin()
+  await busy(hooks)
+  await chat(hooks, "plain", "queue without the command")
+
+  const immediate = output("now", "")
+  await hooks["command.execute.before"]({ sessionID: "session", command: "queue", arguments: "now send immediately" }, immediate)
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, immediate)
+  assert.equal(immediate.parts[0].text, "send immediately")
+  assert.equal(await list(hooks), "1. queue without the command")
+
+  await chat(hooks, "now-shell", "/queue now !pwd")
+  assert.equal(await list(hooks), "1. queue without the command\n2. !pwd")
+
+  const queuedCommand = { parts: [{ type: "text", text: "changes" }] }
+  await hooks["command.execute.before"]({ sessionID: "session", command: "review", arguments: "changes" }, queuedCommand)
+  assert.equal(queuedCommand.parts[0].text, "/queue /review changes")
+
+  await chat(hooks, "clear", "/queue clear")
+  await chat(hooks, "always-off", "/queue always off")
+  hooks = await plugin()
+  await busy(hooks)
+  const direct = output("direct", "send immediately")
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, direct)
+  assert.equal(direct.parts[0].text, "send immediately")
+})
+
+isolated("does not requeue internal replays in always mode", async () => {
+  const replayed = []
+  let done
+  const completed = new Promise((resolve) => (done = resolve))
+  let hooks
+  const receive = async (message) => {
+    await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, message)
+    replayed.push(message.parts[0].text)
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+    if (replayed.length === 2) done()
+  }
+  hooks = await plugin({
+    prompt: async ({ body }) => receive({ ...output("prompt-replay", ""), parts: body.parts }),
+    command: async ({ body }) => {
+      const message = output("command-replay", `ran /${body.command} ${body.arguments}`)
+      await hooks["command.execute.before"]({ sessionID: "session", command: body.command, arguments: body.arguments }, message)
+      return receive(message)
+    },
+  })
+  await chat(hooks, "always-on", "/queue always on")
+  await busy(hooks)
+  await chat(hooks, "prompt", "first")
+  await chat(hooks, "command", "/queue /review changes")
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+  await completed
+  assert.deepEqual(replayed, ["first", "ran /review changes"])
+})
+
 isolated("restores a running queue without replaying until the session finishes", async () => {
   const first = await plugin()
   await busy(first)
@@ -85,6 +143,7 @@ isolated("restores a running queue without replaying until the session finishes"
   await busy(second)
   await second.event({ event: { type: "session.status", properties: { sessionID: "session", status: { type: "idle" } } } })
   assert.equal(await replayed, "resume after restart")
+  assert.equal(await list(second), "Queue is empty")
 })
 
 isolated("replays input queued while the session becomes idle", async () => {

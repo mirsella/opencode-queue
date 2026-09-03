@@ -27,6 +27,7 @@ Restart OpenCode after installing. OpenCode installs npm plugins automatically a
 continue after this task /queue
 /queue front do this next
 do this next /queue front
+/queue now send this immediately
 
 /queue /review
 /review /queue
@@ -56,6 +57,7 @@ do this next /queue front
 | `message /queue` | Queue a normal prompt using trailing syntax. |
 | `/queue front message` | Queue a normal prompt before existing queued entries. |
 | `message /queue front` | Queue a normal prompt before existing queued entries using trailing syntax. |
+| `/queue now input` | Send a prompt or slash command immediately. Shell commands still wait until the session is idle. |
 | `/queue /review` | Queue a slash command. |
 | `/review /queue` | Queue a slash command using trailing syntax. |
 | `/queue front /review` | Queue a slash command before existing queued entries. |
@@ -68,6 +70,8 @@ do this next /queue front
 | `/queue list` | Show the current queue. |
 | `/queue stop` | Pause automatic sending of queued entries. |
 | `/queue start` | Resume automatic sending of queued entries. |
+| `/queue always on` | Automatically queue plain input while the session is busy. |
+| `/queue always off` | Require `/queue` again. |
 | `/queue flush` | Send all queued entries immediately. |
 | `/queue clear` | Clear the current queue. |
 | `/queue clear 1` | Clear item 1 from the current queue. |
@@ -82,9 +86,11 @@ When the session is busy:
 - Each queued entry replays with the agent, model, and thinking variant selected when it was queued.
 - Queued entries replay in order after the session completes normally and becomes idle.
 - `/queue front ...` puts an entry before the existing queued entries.
+- `/queue now ...` sends prompts and slash commands immediately regardless of queue state or mode. Shell commands remain queued until the session is idle.
 - Only one queued entry is sent per idle transition, so queued work runs one item at a time.
 - Queued entries are kept in place after an error, abort, crash, or restart.
 - `/queue stop` pauses automatic replay without clearing queued entries, and `/queue start` resumes it.
+- `/queue always on` also queues plain prompts and custom slash commands while the session is busy, paused, or already has queued work. OpenCode does not expose native shell or `/compact` submissions to these plugin hooks.
 - `/queue flush` sends all queued entries immediately in one batch, even before the session is idle.
 
 When the session is idle:
@@ -100,20 +106,7 @@ When the session is idle:
 - `/queue flush` sends all queued entries immediately in one batch.
 - `/queue clear` clears the current queue, and `/queue clear 1` clears a specific queued item.
 
-## Queue Management
-
-```text
-/queue
-/queue list
-/queue stop
-/queue start
-/queue flush
-/queue clear
-/queue clear 1
-/queue clear 2 3
-```
-
-Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. The `always` setting applies to the whole project and is stored with its queues. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
 
 ## Notes
 

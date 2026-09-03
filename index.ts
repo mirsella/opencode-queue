@@ -11,6 +11,7 @@ const SUFFIX = /^([\s\S]*?)\s+\/queue(?:\s+(front))?\s*$/
 const CMD = /^\/(\S+)(?:\s+([\s\S]*))?$/
 const ITEM_NUMBER = /^[1-9]\d*$/
 const TUI_COMPACT = "session_compact"
+const INTERNAL = "opencodeQueueInternal"
 
 type InputPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput
 type Model = { providerID: string; modelID: string }
@@ -19,7 +20,7 @@ type Info = { agent: string; model: Model; variant?: string }
 type Msg = { info: { role: string; agent?: string; mode?: string; model?: Model; providerID?: string; modelID?: string; variant?: string } }
 type Ask = { type: string; properties: { id: string; sessionID: string; questions: { question: string; header: string }[] } }
 type Post = (input: { url: string; path?: Record<string, string>; body?: unknown; headers?: Record<string, string> }) => Promise<{ response?: Response; error?: unknown } | undefined>
-type QueueInput = { body: string; front: boolean }
+type QueueInput = { body: string; modifier?: "front" | "now" }
 
 type Item =
   | { kind: "prompt"; info: Info; body: string; parts: InputPart[] }
@@ -33,32 +34,34 @@ type EntryOp =
   | { kind: "compact"; source: string }
   | { kind: "shell"; source: string; shell: string }
 
-type Activity = { kind: "idle" } | { kind: "restored" } | { kind: "busy" } | { kind: "sending"; idle: boolean; items: Item[] }
-type State = { items: Item[]; activity: Activity; stopped: boolean; failed: boolean; hidden: Set<string> }
-type Durable = Pick<State, "items" | "stopped" | "hidden">
-type Store = { version: 1; projectID: string; sessions: Record<string, { items: Item[]; stopped: boolean; hidden: string[] }> }
-type Placeholder = { id: string; part: TextPart }
-
-type Op =
+type ControlOp =
   | { kind: "list" }
   | { kind: "clear"; indices: number[] }
   | { kind: "flush" }
   | { kind: "start" }
   | { kind: "stop" }
+  | { kind: "always"; enabled: boolean }
+
+type Activity = { kind: "idle" } | { kind: "restored" } | { kind: "busy" } | { kind: "sending"; idle: boolean; items: Item[] }
+type State = { items: Item[]; activity: Activity; stopped: boolean; failed: boolean; hidden: Set<string> }
+type Draft = Pick<State, "items" | "stopped" | "hidden"> & { always: boolean }
+type Store = { version: 1; projectID: string; always: boolean; sessions: Record<string, { items: Item[]; stopped: boolean; hidden: string[] }> }
+type Placeholder = { id: string; part: TextPart }
+
+type Op =
+  | ControlOp
   | { kind: "invalid"; message: string }
   | (EntryOp & { front: boolean })
 
-type ControlOp = Extract<Op, { kind: "list" | "clear" | "flush" | "start" | "stop" }>
-
 const parsePrefix = (body: string): QueueInput => {
-  const match = body.trim().match(/^front(?:\s+([\s\S]*))?$/)
-  return match ? { body: match[1] ?? "", front: true } : { body, front: false }
+  const match = body.trim().match(/^(front|now)(?:\s+([\s\S]*))?$/)
+  return match ? { body: match[2] ?? "", modifier: match[1] === "front" ? "front" : "now" } : { body }
 }
 
 const parse = (input: QueueInput, files = 0): Op => {
   const text = input.body.trim()
-  const front = input.front
-  if (!front && !files) {
+  const front = input.modifier === "front"
+  if (!input.modifier && !files) {
     switch (text) {
       case "":
       case "list":
@@ -71,6 +74,9 @@ const parse = (input: QueueInput, files = 0): Op => {
         return { kind: "stop" }
     }
 
+    if (text === "always on" || text === "always off") return { kind: "always", enabled: text === "always on" }
+    if (/^always(?:\s|$)/.test(text)) return { kind: "invalid", message: "Queue always expects on or off" }
+
     const clear = text.match(/^clear(?:\s+([\s\S]+))?$/)
     if (clear) {
       const values = clear[1]?.trim().split(/\s+/) ?? []
@@ -79,7 +85,7 @@ const parse = (input: QueueInput, files = 0): Op => {
       return { kind: "clear", indices }
     }
   }
-  if (front && !text && !files) return { kind: "invalid", message: "Queue front input is empty" }
+  if (input.modifier && !text && !files) return { kind: "invalid", message: `Queue ${input.modifier} input is empty` }
 
   if (text.startsWith("!")) {
     const shell = text.slice(1).trim()
@@ -104,11 +110,11 @@ const parse = (input: QueueInput, files = 0): Op => {
 
 const parseSuffix = (text: string): QueueInput | undefined => {
   const trimmed = text.trim()
-  if (trimmed === "/queue") return { body: "", front: false }
-  if (trimmed === "/queue front") return { body: "", front: true }
+  if (trimmed === "/queue") return { body: "" }
+  if (trimmed === "/queue front") return { body: "", modifier: "front" }
 
   const match = text.match(SUFFIX)
-  return match ? { body: match[1], front: match[2] === "front" } : undefined
+  return match ? { body: match[1], modifier: match[2] ? "front" : undefined } : undefined
 }
 const stripSuffix = (text: string) => parseSuffix(text)?.body ?? text
 const parseInput = (text: string): QueueInput | undefined => {
@@ -122,6 +128,7 @@ const control = (op: Op): op is ControlOp => {
     case "flush":
     case "start":
     case "stop":
+    case "always":
       return true
     default:
       return false
@@ -196,8 +203,11 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const sessions = new Map<string, State>()
   const deleted = new Set<string>()
   const enqueueTurns = new Map<string, Promise<unknown>>()
+  const internalCommands: { sid: string; command: string; args: string; used: boolean }[] = []
+  const origin = randomUUID()
   const post = (client as unknown as { _client?: { post?: Post } })._client?.post
   const path = join(dataHome(), "opencode", "opencode-queue", `${createHash("sha256").update(project.id).digest("hex")}.json`)
+  let alwaysQueue = false
   let writes = Promise.resolve()
 
   try {
@@ -205,6 +215,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     if (!record(parsed) || parsed.version !== 1 || parsed.projectID !== project.id || !record(parsed.sessions)) {
       console.warn("QueuePlugin ignored invalid queue storage", path)
     } else {
+      if (typeof parsed.always === "boolean") alwaysQueue = parsed.always
+      else if (parsed.always !== undefined) console.warn("QueuePlugin ignored invalid always queue setting", path)
       for (const [sid, value] of Object.entries(parsed.sessions)) {
         if (!record(value) || typeof value.stopped !== "boolean" || !Array.isArray(value.items)) {
           console.warn("QueuePlugin skipped invalid stored session", sid)
@@ -223,8 +235,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load queue storage", error)
   }
 
-  const save = async (sid?: string, draft?: Durable) => {
-    const stored: Store = { version: 1, projectID: project.id, sessions: {} }
+  const save = async (sid?: string, draft?: Draft) => {
+    const stored: Store = { version: 1, projectID: project.id, always: draft?.always ?? alwaysQueue, sessions: {} }
     for (const [id, current] of sessions) {
       if (deleted.has(id) || (id === sid && !draft)) continue
       const durable = id === sid ? draft! : current
@@ -257,7 +269,9 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     return current
   }
 
-  const store = async (sid: string, current: State, draft: Durable, placeholder?: Placeholder) => {
+  const automaticallyQueue = (sid: string) => alwaysQueue && shouldQueue(sessions.get(sid))
+
+  const store = async (sid: string, current: State, draft: Draft, placeholder?: Placeholder) => {
     try {
       await save(sid, draft)
     } catch (error) {
@@ -267,14 +281,15 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     current.items.splice(0, current.items.length, ...draft.items)
     current.stopped = draft.stopped
     current.hidden = draft.hidden
+    alwaysQueue = draft.always
     if (placeholder) Object.assign(placeholder.part, { text: "", synthetic: true, ignored: true })
   }
 
-  const persist = <T>(sid: string, placeholder: Placeholder | undefined, mutate: (draft: Durable) => T) =>
+  const persist = <T>(sid: string, placeholder: Placeholder | undefined, mutate: (draft: Draft) => T) =>
     serialize(async () => {
       if (deleted.has(sid)) throw new Error(`QueuePlugin cannot persist queue state for deleted session ${sid}`)
       const current = state(sid)
-      const draft: Durable = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden) }
+      const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden), always: alwaysQueue }
       if (placeholder) draft.hidden.add(placeholder.id)
       const value = mutate(draft)
       await store(sid, current, draft, placeholder)
@@ -364,6 +379,21 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       throwOnError: true,
     })
 
+  const markInternal = (parts: { type: string; metadata?: Record<string, unknown> }[]) => {
+    const text = parts.find((part) => part.type === "text")
+    if (text) text.metadata = { ...text.metadata, [INTERNAL]: origin }
+  }
+
+  const callCommand = async <T>(sid: string, command: string, args: string, call: () => Promise<T>) => {
+    const pending = { sid, command, args, used: false }
+    internalCommands.push(pending)
+    try {
+      return await call()
+    } finally {
+      internalCommands.splice(internalCommands.indexOf(pending), 1)
+    }
+  }
+
   const replay = async (sid: string, item: Item) => {
     switch (item.kind) {
       case "shell":
@@ -371,19 +401,22 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       case "compact":
         return compact(sid, item.info)
       case "command":
-        return client.session.command({
-          path: { id: sid },
-          body: {
-            ...opts(item.info),
-            model: `${item.info.model.providerID}/${item.info.model.modelID}`,
-            command: item.cmd,
-            arguments: item.args,
-            parts: item.files,
-          } as any,
-          throwOnError: true,
-        })
+        return callCommand(sid, item.cmd, item.args, () =>
+          client.session.command({
+            path: { id: sid },
+            body: {
+              ...opts(item.info),
+              model: `${item.info.model.providerID}/${item.info.model.modelID}`,
+              command: item.cmd,
+              arguments: item.args,
+              parts: item.files,
+            } as any,
+            throwOnError: true,
+          }),
+        )
       case "prompt": {
         const parts = item.parts.map((part) => ({ ...part, id: undefined }))
+        markInternal(parts)
         return client.session.prompt({ path: { id: sid }, body: { ...opts(item.info), parts } as any, throwOnError: true })
       }
     }
@@ -420,7 +453,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
       const items = current.items.slice(0, count)
       if (placeholder) {
-        const draft: Durable = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden).add(placeholder.id) }
+        const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden).add(placeholder.id), always: alwaysQueue }
         await store(sid, current, draft, placeholder)
         if (deleted.has(sid)) return undefined
       }
@@ -502,6 +535,9 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         case "start":
           draft.stopped = false
           return "Queue started"
+        case "always":
+          draft.always = op.enabled
+          return `Always queue ${op.enabled ? "enabled" : "disabled"} for this project`
       }
     })
     if (op.kind === "start") {
@@ -576,8 +612,15 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       const body = input.arguments ?? ""
       const parts = files(output.parts)
 
+      const internal = internalCommands.find((pending) => !pending.used && pending.sid === sid && pending.command === input.command && pending.args === body)
+      if (internal) {
+        internal.used = true
+        markInternal(output.parts)
+        return
+      }
+
       if (input.command !== "queue") {
-        const queued = parseSuffix(body)
+        const queued = parseSuffix(body) ?? (automaticallyQueue(sid) ? { body } : undefined)
         if (!queued) return
 
         if (!shouldQueue(sessions.get(sid))) {
@@ -585,16 +628,17 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
           return
         }
 
-        output.parts.splice(0, output.parts.length, { type: "text", text: `/queue${queued.front ? " front" : ""} /${input.command}${queued.body.trim() ? ` ${queued.body.trim()}` : ""}` } as any, ...parts)
+        output.parts.splice(0, output.parts.length, { type: "text", text: `/queue${queued.modifier === "front" ? " front" : ""} /${input.command}${queued.body.trim() ? ` ${queued.body.trim()}` : ""}` } as any, ...parts)
         return
       }
 
-      const op = parse(parsePrefix(body), parts.length)
+      const request = parsePrefix(body)
+      const op = parse(request, parts.length)
 
       if (control(op)) return stop(await afterEnqueue(sid, () => manage(sid, op)))
       if (op.kind === "invalid") return stop(op.message, "error")
 
-      if (!shouldQueue(sessions.get(sid))) {
+      if (!shouldQueue(sessions.get(sid)) || (request.modifier === "now" && op.kind !== "prompt" && op.kind !== "shell")) {
         if (op.kind === "shell") {
           await shell(sid, op.shell, await run(sid))
           return handled()
@@ -606,7 +650,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         }
 
         if (op.kind === "command") {
-          await client.session.command({ path: { id: sid }, body: { command: op.cmd, arguments: op.args, parts } as any })
+          await callCommand(sid, op.cmd, op.args, () => client.session.command({ path: { id: sid }, body: { command: op.cmd, arguments: op.args, parts } as any }))
           return handled()
         }
 
@@ -622,10 +666,15 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         console.warn("QueuePlugin ignored input for a deleted session", sid)
         return
       }
+      const internal = output.parts.find((part): part is TextPart => part.type === "text" && part.metadata?.[INTERNAL] === origin)
+      if (internal) {
+        delete internal.metadata![INTERNAL]
+        return
+      }
       const text = output.parts.find((part): part is TextPart => part.type === "text" && !part.synthetic)
       if (!text) return
 
-      const request = parseInput(text.text)
+      const request = parseInput(text.text) ?? (automaticallyQueue(sid) ? { body: text.text } : undefined)
       if (!request) return
 
       const current = state(sid)
@@ -645,7 +694,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         return
       }
 
-      if (!shouldQueue(current)) {
+      if ((request.modifier === "now" && op.kind !== "shell") || !shouldQueue(current)) {
         if (op.kind === "command") return
         if (op.kind === "compact") {
           await persist(sid, placeholder, () => undefined)
