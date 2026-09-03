@@ -74,6 +74,8 @@ isolated("persists always mode and bypasses it with now", async () => {
   let hooks = await plugin()
   await chat(hooks, "always-on", "/queue always on")
   hooks = await plugin()
+  await chat(hooks, "always-status", "/queue always")
+  assert.equal(hooks.toasts.at(-1), "Always queue is on for this project")
   await busy(hooks)
   await chat(hooks, "plain", "queue without the command")
 
@@ -101,6 +103,9 @@ isolated("persists always mode and bypasses it with now", async () => {
 
 isolated("accepts q as a queue alias", async () => {
   const hooks = await plugin()
+  const config = {}
+  await hooks.config(config)
+  assert.deepEqual(Object.keys(config.command).sort(), ["q", "queue"])
   await busy(hooks)
   await chat(hooks, "last", "/q last")
   await chat(hooks, "first", "first /q front")

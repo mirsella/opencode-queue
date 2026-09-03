@@ -72,6 +72,7 @@ do this next /queue front
 | `/queue list` | Show the current queue. |
 | `/queue stop` | Pause automatic sending of queued entries. |
 | `/queue start` | Resume automatic sending of queued entries. |
+| `/queue always` | Show whether automatic queueing is enabled for this project. |
 | `/queue always on` | Automatically queue plain input while the session is busy. |
 | `/queue always off` | Require `/queue` again. |
 | `/queue flush` | Send all queued entries immediately. |

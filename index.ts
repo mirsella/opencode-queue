@@ -39,7 +39,7 @@ type ControlOp =
   | { kind: "flush" }
   | { kind: "start" }
   | { kind: "stop" }
-  | { kind: "always"; enabled: boolean }
+  | { kind: "always"; enabled?: boolean }
 
 type Activity = { kind: "idle" } | { kind: "restored" } | { kind: "busy" } | { kind: "sending"; idle: boolean; items: Item[] }
 type State = { items: Item[]; activity: Activity; stopped: boolean; failed: boolean; hidden: Set<string> }
@@ -75,6 +75,7 @@ const parse = (input: QueueInput, files = 0): Op => {
         return { kind: "stop" }
     }
 
+    if (text === "always") return { kind: "always" }
     if (text === "always on" || text === "always off") return { kind: "always", enabled: text === "always on" }
     if (/^always(?:\s|$)/.test(text)) return { kind: "invalid", message: "Queue always expects on or off" }
 
@@ -533,8 +534,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
           draft.stopped = false
           return "Queue started"
         case "always":
-          draft.always = op.enabled
-          return `Always queue ${op.enabled ? "enabled" : "disabled"} for this project`
+          if (op.enabled !== undefined) draft.always = op.enabled
+          return `Always queue is ${draft.always ? "on" : "off"} for this project`
       }
     })
     if (op.kind === "start") {
@@ -547,7 +548,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const hooks: Awaited<ReturnType<Plugin>> = {
     config: async (cfg) => {
       cfg.command ??= {}
-      cfg.command.queue = { template: "", description: "Queue input until the session is idle" }
+      cfg.command.q = cfg.command.queue = { template: "", description: "Queue input until the session is idle" }
     },
     event: async ({ event }) => {
       if (plan(event)) {
