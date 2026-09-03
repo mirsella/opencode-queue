@@ -151,7 +151,7 @@ isolated("restores a running queue without replaying until the session finishes"
   await busy(second)
   await second.event({ event: { type: "session.status", properties: { sessionID: "session", status: { type: "idle" } } } })
   assert.equal(await replayed, "resume after restart")
-  assert.equal(await list(second), "Queue is empty")
+  assert.equal(await list(second), "1. later")
 })
 
 isolated("replays input queued while the session becomes idle", async () => {
