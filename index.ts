@@ -41,7 +41,11 @@ type ControlOp =
   | { kind: "stop" }
   | { kind: "always"; enabled?: boolean }
 
-type Activity = { kind: "idle" } | { kind: "restored" } | { kind: "busy" } | { kind: "sending"; idle: boolean; items: Item[] }
+type Activity =
+  | { kind: "idle" }
+  | { kind: "restored" }
+  | { kind: "busy" }
+  | { kind: "sending"; idle: boolean; batches: { items: Item[]; pending: boolean }[] }
 type State = { items: Item[]; activity: Activity; stopped: boolean; failed: boolean; hidden: Set<string> }
 type Draft = Pick<State, "items" | "stopped" | "hidden">
 type Store = { version: 1; projectID: string; sessions: Record<string, { items: Item[]; stopped: boolean; hidden: string[] }> }
@@ -267,7 +271,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     for (const [id, current] of sessions) {
       if (deleted.has(id) || (id === sid && !draft)) continue
       const durable = id === sid ? draft! : current
-      const items = current.activity.kind === "sending" ? [...current.activity.items, ...durable.items] : durable.items
+      const items = current.activity.kind === "sending" ? current.activity.batches.flatMap((batch) => batch.items).concat(durable.items) : durable.items
       if (items.length || durable.stopped || durable.hidden.size) stored.sessions[id] = { items, stopped: durable.stopped, hidden: [...durable.hidden] }
     }
     await writeJson(path, stored)
@@ -462,12 +466,10 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   }
 
   const flush = async (sid: string, count = Infinity, placeholder?: Placeholder) => {
-    type Reservation = "active" | undefined | { current: State; items: Item[]; sending: Extract<Activity, { kind: "sending" }> }
-
-    const reservation = await serialize<Reservation>(async () => {
+    const reservation = await serialize(async () => {
       if (deleted.has(sid)) return undefined
       const current = state(sid)
-      if (count === 1 && !placeholder && (current.activity.kind !== "idle" || current.stopped || !current.items.length)) return undefined
+      if (count === 1 && (current.activity.kind !== "idle" || current.stopped || current.failed)) return undefined
 
       const items = current.items.slice(0, count)
       if (placeholder) {
@@ -475,65 +477,64 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         await store(sid, current, draft, placeholder)
         if (deleted.has(sid)) return undefined
       }
-      if (current.activity.kind === "sending") return "active"
       if (!items.length) return undefined
+      if (count !== 1) current.failed = false
 
-      const sending: Extract<Activity, { kind: "sending" }> = { kind: "sending", idle: false, items }
+      // Prompt requests stay pending until the agent finishes; new flushes can still steer it.
+      const sending: Extract<Activity, { kind: "sending" }> = current.activity.kind === "sending"
+        ? current.activity
+        : { kind: "sending", idle: false, batches: [] }
+      const batch = { items, pending: true }
+      sending.batches.push(batch)
       current.items.splice(0, items.length)
       current.activity = sending
-      return { current, items, sending }
+      return { current, items, sending, batch }
     })
 
-    if (reservation === "active") {
-      console.warn("QueuePlugin ignored a concurrent queue flush", sid)
-      return undefined
-    }
     if (!reservation) return { sent: 0, failed: 0 }
 
-    const { current, items, sending } = reservation
-    const results = await Promise.all(
+    const { current, items, sending, batch } = reservation
+    const retry = (await Promise.all(
       items.map(async (item) => {
         try {
           await replay(sid, item)
-          return { item, failed: false }
+          return []
         } catch (error) {
           console.error("QueuePlugin failed to flush queued input", error)
           await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
-          return { item, failed: true }
+          return [item]
         }
       }),
-    )
-    const retry = results.flatMap((result) => (result.failed ? [result.item] : []))
-    const resume = await serialize(async () => {
-      if (sessions.get(sid) !== current) return false
-      if (current.activity !== sending) throw new Error(`QueuePlugin lost track of in-flight queued items for session ${sid}`)
+    )).flat()
+    await serialize(async () => {
+      if (sessions.get(sid) !== current) return
+      if (current.activity !== sending || !batch.pending || !sending.batches.includes(batch)) throw new Error(`QueuePlugin lost track of in-flight queued items for session ${sid}`)
 
-      sending.items = retry
+      batch.pending = false
+      batch.items = retry
+      if (retry.length) current.failed = true
       try {
         await save()
       } catch (error) {
-        sending.items = items
-        current.items.unshift(...items)
-        current.activity = sending.idle ? { kind: "idle" } : { kind: "busy" }
+        batch.items = items
+        current.failed = true
         console.error("QueuePlugin failed to persist queues", error)
         throw error
+      } finally {
+        if (!sending.batches.some((entry) => entry.pending)) {
+          const queued = sending.batches.flatMap((entry) => entry.items)
+          current.items.unshift(...queued)
+          current.activity = { kind: sending.idle || queued.length ? "idle" : "busy" }
+        }
       }
-
-      const failed = current.failed
-      if (retry.length) current.items.unshift(...retry)
-      if (sending.idle) {
-        current.activity = { kind: "idle" }
-      } else current.activity = retry.length ? { kind: "idle" } : { kind: "busy" }
-      return sending.idle && !failed && count === 1 && !retry.length
     })
-    if (resume) advance(sid)
+    advance(sid)
     return { sent: items.length - retry.length, failed: retry.length }
   }
 
   const manage = async (sid: string, op: ControlOp, placeholder?: Placeholder) => {
     if (op.kind === "flush") {
       const result = await flush(sid, Infinity, placeholder)
-      if (!result) return "Queue is already flushing"
       if (!result.sent && !result.failed) return "Queue is empty"
       const message = `Flushed ${result.sent} queued item${result.sent === 1 ? "" : "s"}`
       return result.failed ? `${message}; ${result.failed} failed` : message
@@ -625,8 +626,12 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       if (deleted.has(sid)) return
       const current = state(sid)
       if (event.properties.status.type !== "idle") {
-        if (current.activity.kind !== "sending") current.activity = { kind: "busy" }
-        current.failed = false
+        if (current.activity.kind === "sending") {
+          current.activity.idle = false
+        } else {
+          current.activity = { kind: "busy" }
+          current.failed = false
+        }
         return
       }
 

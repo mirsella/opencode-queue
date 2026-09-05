@@ -8,6 +8,12 @@ import { QueuePlugin } from "./index.ts"
 
 const model = { providerID: "test", modelID: "model" }
 
+const deferred = () => {
+  let resolve, reject
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
 const output = (id, text) => ({
   message: { id, agent: "build", model },
   parts: [{ id: `${id}-part`, type: "text", text }],
@@ -327,7 +333,7 @@ isolated("keeps an in-flight item durable until replay succeeds", async () => {
   const flushing = chat(first, "flush", "/queue flush")
   await replayStarted
   await chat(first, "concurrent-flush", "/queue flush")
-  assert.equal(first.toasts.at(-1), "Queue is already flushing")
+  assert.equal(first.toasts.at(-1), "Queue is empty")
 
   const recovered = await plugin()
   assert.equal(await list(recovered), "1. retry after crash\nQueue is stopped")
@@ -353,4 +359,123 @@ isolated("keeps a queued item after an SDK replay error", async () => {
 
   const recovered = await plugin()
   assert.equal(await list(recovered), "1. do not lose this\nQueue is stopped")
+})
+
+isolated("flush steers all remaining messages while an automatic replay is still running", async () => {
+  const replayed = []
+  const requests = Array.from({ length: 3 }, () => ({ started: deferred(), finished: deferred() }))
+  const current = await plugin({
+    prompt: async ({ body }) => {
+      const index = replayed.length
+      const message = { ...output(`replay-${index}`, ""), parts: body.parts }
+      replayed.push(message)
+      await current["chat.message"]({ sessionID: "session", agent: "build", model }, message)
+      requests[index].started.resolve()
+      await requests[index].finished.promise
+    },
+    abort: () => assert.fail("flush must not interrupt the agent"),
+  })
+  await chat(current, "always", "/queue always on")
+  await busy(current)
+  await chat(current, "first", "/queue first")
+  await chat(current, "second", "/queue second")
+  await chat(current, "third", "/queue third")
+  await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+  await requests[0].started.promise
+  await busy(current)
+
+  const flushing = assert.rejects(
+    current["command.execute.before"]({ sessionID: "session", command: "queue", arguments: "flush" }, { parts: [] }),
+    (response) => response.status === 204,
+  )
+  await Promise.all(requests.map((request) => request.started.promise))
+  assert.deepEqual(replayed.map((message) => message.parts[0].text), ["first", "second", "third"])
+  const transformed = { messages: replayed.map((message) => ({ info: message.message })) }
+  await current["experimental.chat.messages.transform"]({}, transformed)
+  assert.equal(transformed.messages.length, 3)
+  assert.equal(await list(current), "Queue is empty")
+
+  // Finishing the manual batch must not remove the still-running automatic replay.
+  requests[1].finished.resolve()
+  requests[2].finished.resolve()
+  await flushing
+  const recovered = await plugin()
+  assert.equal(await list(recovered), "1. first")
+  requests[0].finished.resolve()
+  await list(current)
+})
+
+for (const [order, busyAgain] of [[[0, 1], false], [[1, 0], false], [[0, 1], true], [[1, 0], true]]) {
+  isolated(`concurrent flushes settle in order ${order}, busy again: ${busyAgain}`, async () => {
+    const requests = Array.from({ length: 3 }, () => ({ started: deferred(), finished: deferred() }))
+    const replayed = []
+    const current = await plugin({ prompt: async ({ body }) => {
+      const index = replayed.length
+      replayed.push(body.parts[0].text)
+      requests[index].started.resolve()
+      await requests[index].finished.promise
+    } })
+    await busy(current)
+    await chat(current, "first", "/queue first")
+    const first = chat(current, "flush-first", "/queue flush")
+    await requests[0].started.promise
+    await chat(current, "second", "/queue second")
+    const second = chat(current, "flush-second", "/queue flush")
+    await requests[1].started.promise
+    await chat(current, "third", "/queue third")
+
+    await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+    if (busyAgain) await busy(current)
+    const flushing = [first, second]
+    for (const index of order) {
+      requests[index].finished.resolve()
+      await flushing[index]
+      if (busyAgain || index === order[0]) assert.deepEqual(replayed, ["first", "second"])
+      if (index === order[0]) {
+        const remaining = index === 0 ? "second" : "first"
+        assert.equal(await list(await plugin()), `1. ${remaining}\n2. third`)
+      }
+    }
+
+    if (busyAgain) {
+      assert.equal(await list(current), "1. third")
+      await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+    }
+    await requests[2].started.promise
+    assert.deepEqual(replayed, ["first", "second", "third"])
+    requests[2].finished.resolve()
+    await list(current)
+  })
+}
+
+isolated("concurrent flushes preserve failed order and stop after later busy events", async () => {
+  const requests = Array.from({ length: 2 }, () => ({ started: deferred(), finished: deferred() }))
+  const replayed = []
+  const current = await plugin({ prompt: async ({ body }) => {
+    const text = body.parts[0].text
+    const index = replayed.length
+    replayed.push(text)
+    requests[index].started.resolve()
+    await requests[index].finished.promise
+    if (text === "retry") throw new Error("request failed")
+  } })
+  await busy(current)
+  await chat(current, "retry", "/queue retry")
+  const first = chat(current, "flush-first", "/queue flush")
+  await requests[0].started.promise
+  await chat(current, "second", "/queue second")
+  const second = chat(current, "flush-second", "/queue flush")
+  await requests[1].started.promise
+  await chat(current, "third", "/queue third")
+
+  requests[0].finished.resolve()
+  await first
+  await busy(current)
+  assert.equal(await list(await plugin()), "1. retry\n2. second\n3. third")
+
+  requests[1].finished.resolve()
+  await second
+  await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+  assert.deepEqual(replayed, ["retry", "second"])
+  assert.equal(await list(current), "1. retry\n2. third")
 })
