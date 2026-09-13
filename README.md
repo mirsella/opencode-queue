@@ -81,8 +81,8 @@ do this next /queue front
 | `/queue always on` | Enable automatic queueing in every project. |
 | `/queue always off` | Disable automatic queueing in every project. |
 | `/queue flush` | Send waiting entries immediately, up to the next carry boundary. |
-| `/queue clear` | Clear the current queue. |
-| `/queue clear 1` | Clear item 1 from the current queue. |
+| `/queue clear` | Clear the current queue, including carry boundaries. |
+| `/queue clear 1` | Clear item 1 from the current queue, whether it is input or a carry boundary. |
 | `/queue clear 2 3` | Clear items 2 and 3 from the current queue. |
 
 ## Behavior
@@ -140,7 +140,13 @@ For example, while the first task is running:
 5. implement the third task
 ```
 
-Use `/queue clear 2` to remove the first boundary and run the second task in the current session instead. `/queue front carry` moves all waiting work to a fresh session after the current run finishes. Trailing syntax, such as `carry /q`, also works.
+Carry boundaries work with the usual queue controls:
+
+- `/queue front carry` puts a carry before all waiting entries, so they move to a fresh session after the current run finishes.
+- `/queue clear 2` removes the first boundary in the example above, so the second task runs in the current session instead. Use the item number shown by `/queue list`.
+- `/queue clear` clears the whole queue, including carry boundaries.
+
+Trailing syntax, such as `carry /q` or `carry /queue front`, also works.
 
 The previous session's queue becomes empty after the transfer. Boundaries survive restarts along with the rest of the queue. A failed session creation or transfer leaves the source queue intact for retry with `/queue start` or `/queue flush`.
 
