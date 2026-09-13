@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { AgentPartInput, FilePart, FilePartInput, SubtaskPartInput, TextPart, TextPartInput } from "@opencode-ai/sdk"
 import { HttpServerResponse } from "effect/unstable/http"
 import { createHash, randomUUID } from "node:crypto"
-import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -21,13 +21,15 @@ type Ask = { type: string; properties: { id: string; sessionID: string; question
 type Post = (input: { url: string; path?: Record<string, string>; body?: unknown; headers?: Record<string, string> }) => Promise<{ response?: Response; error?: unknown } | undefined>
 type QueueInput = { body: string; modifier?: "front" | "now" }
 
-type Item =
+type ReplayItem =
   | { kind: "prompt"; info: Info; body: string; parts: InputPart[] }
   | { kind: "command"; info: Info; source: string; cmd: string; args: string; files: FilePartInput[] }
   | { kind: "compact"; info: Info; source: string }
   | { kind: "shell"; info: Info; source: string; shell: string }
+type Item = ReplayItem | { kind: "carry" }
 
 type EntryOp =
+  | { kind: "carry" }
   | { kind: "prompt"; body: string }
   | { kind: "command"; source: string; cmd: string; args: string }
   | { kind: "compact"; source: string }
@@ -41,12 +43,10 @@ type ControlOp =
   | { kind: "stop" }
   | { kind: "always"; enabled?: boolean }
 
-type Activity =
-  | { kind: "idle" }
-  | { kind: "restored" }
-  | { kind: "busy" }
-  | { kind: "sending"; idle: boolean; batches: { items: Item[]; pending: boolean }[] }
-type State = { items: Item[]; activity: Activity; stopped: boolean; failed: boolean; hidden: Set<string> }
+type Activity = { readonly kind: "idle" | "restored" | "busy" }
+type Carrying = { kind: "carrying"; item: Extract<Item, { kind: "carry" }>; automatic: boolean }
+type Sending = { kind: "sending"; batches: { items: ReplayItem[]; pending: boolean }[] }
+type State = { items: Item[]; activity: Activity; flight?: Carrying | Sending; stopped: boolean; failed: boolean; hidden: Set<string> }
 type Draft = Pick<State, "items" | "stopped" | "hidden">
 type Store = { version: 1; projectID: string; sessions: Record<string, { items: Item[]; stopped: boolean; hidden: string[] }> }
 type Placeholder = { id: string; part: TextPart }
@@ -66,6 +66,11 @@ const parsePrefix = (body: string): QueueInput => {
 const parse = (input: QueueInput, files = 0): Op => {
   const text = input.body.trim()
   const front = input.modifier === "front"
+  if (text === "carry") {
+    if (files) return { kind: "invalid", message: "Queue carry does not support attachments" }
+    if (input.modifier === "now") return { kind: "invalid", message: "Queue carry must wait until the session is idle" }
+    return { kind: "carry", front }
+  }
   if (!input.modifier && !files) {
     switch (text) {
       case "":
@@ -136,13 +141,20 @@ const control = (op: Op): op is ControlOp => {
       return false
   }
 }
-const shouldQueue = (state?: State) => Boolean(state && (state.activity.kind !== "idle" || state.stopped || state.items.length))
-const shouldDeclinePlan = (state?: State) => Boolean(state && (state.activity.kind === "sending" || (!state.stopped && state.items.length)))
+const shouldQueue = (state?: State) => Boolean(state && (state.flight || state.activity.kind !== "idle" || state.stopped || state.items.length))
+const canAdvance = (state: State) => !state.flight && state.activity.kind === "idle" && !state.stopped && !state.failed && state.items.length > 0
+const shouldDeclinePlan = (state?: State) => Boolean(state && (state.flight?.kind === "sending" || (!state.stopped && state.items.length)))
 const itemText = (item: Item) => {
+  if (item.kind === "carry") return "carry: new session"
   if (item.kind !== "prompt") return item.source
   const body = item.body.trim()
   const count = item.parts.filter((part) => part.type === "file").length
   return body || `${count} attachment${count === 1 ? "" : "s"}`
+}
+const describeQueue = (state?: Draft) => {
+  let boundary = 0
+  const list = state?.items.map((item, i) => `${i + 1}. ${item.kind === "carry" ? `--- carry: new session ${++boundary} ---` : itemText(item)}`).join("\n") || "Queue is empty"
+  return state?.stopped ? `${list}\nQueue is stopped` : list
 }
 // OpenCode's command hook has no cancel/noReply output. Throwing a raw Effect
 // response is handled by OpenCode's HTTP layer as an empty successful command.
@@ -179,7 +191,9 @@ const validPart = (value: unknown): value is InputPart => {
   }
 }
 const validItem = (value: unknown): value is Item => {
-  if (!record(value) || !validInfo(value.info)) return false
+  if (!record(value)) return false
+  if (value.kind === "carry") return true
+  if (!validInfo(value.info)) return false
   switch (value.kind) {
     case "prompt":
       return typeof value.body === "string" && Array.isArray(value.parts) && value.parts.length > 0 && value.parts.every(validPart)
@@ -201,12 +215,12 @@ const dataHome = () => {
   return join(homedir(), ".local", "share")
 }
 
-const writeJson = async (path: string, value: unknown, commit = rename) => {
+const writeJson = async (path: string, value: unknown) => {
   await mkdir(dirname(path), { recursive: true })
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
   try {
     await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-    await commit(temporary, path)
+    await rename(temporary, path)
   } finally {
     await rm(temporary, { force: true }).catch((error) => console.warn("QueuePlugin failed to remove temporary storage", error))
   }
@@ -234,8 +248,6 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     }
     return false
   }
-  let legacyAlways = false
-
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
     if (!record(parsed) || parsed.version !== 1 || parsed.projectID !== project.id || !record(parsed.sessions)) {
@@ -254,27 +266,22 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         const activity: Activity = { kind: items.length && !value.stopped ? "restored" : "idle" }
         if (items.length || value.stopped || hidden.size) sessions.set(sid, { items, activity, stopped: value.stopped, failed: false, hidden })
       }
-      legacyAlways = parsed.always === true
     }
   } catch (error) {
     if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load queue storage", error)
   }
-  if (legacyAlways) {
-    try {
-      await writeJson(settingsPath, { always: true }, link)
-    } catch (error) {
-      if (!record(error) || error.code !== "EEXIST") throw error
-    }
-  }
-  const save = async (sid?: string, draft?: Draft) => {
+  // Call inside serialize: publish drafts in memory only after the atomic disk write.
+  const commit = async (...updates: [State, Draft][]) => {
+    const drafts = new Map(updates)
     const stored: Store = { version: 1, projectID: project.id, sessions: {} }
     for (const [id, current] of sessions) {
-      if (deleted.has(id) || (id === sid && !draft)) continue
-      const durable = id === sid ? draft! : current
-      const items = current.activity.kind === "sending" ? current.activity.batches.flatMap((batch) => batch.items).concat(durable.items) : durable.items
+      if (deleted.has(id)) continue
+      const durable = drafts.get(current) ?? current
+      const items = current.flight?.kind === "sending" ? current.flight.batches.flatMap<Item>((batch) => batch.items).concat(durable.items) : durable.items
       if (items.length || durable.stopped || durable.hidden.size) stored.sessions[id] = { items, stopped: durable.stopped, hidden: [...durable.hidden] }
     }
     await writeJson(path, stored)
+    for (const [current, draft] of updates) Object.assign(current, draft)
   }
 
   const serialize = <T>(action: () => Promise<T>) => {
@@ -294,19 +301,6 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
   const automaticallyQueue = async (sid: string) => shouldQueue(sessions.get(sid)) && (await readAlways())
 
-  const store = async (sid: string, current: State, draft: Draft, placeholder?: Placeholder) => {
-    try {
-      await save(sid, draft)
-    } catch (error) {
-      console.error("QueuePlugin failed to persist queues", error)
-      throw error
-    }
-    current.items.splice(0, current.items.length, ...draft.items)
-    current.stopped = draft.stopped
-    current.hidden = draft.hidden
-    if (placeholder) Object.assign(placeholder.part, { text: "", synthetic: true, ignored: true })
-  }
-
   const persist = <T>(sid: string, placeholder: Placeholder | undefined, mutate: (draft: Draft) => T) =>
     serialize(async () => {
       if (deleted.has(sid)) throw new Error(`QueuePlugin cannot persist queue state for deleted session ${sid}`)
@@ -314,7 +308,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden) }
       if (placeholder) draft.hidden.add(placeholder.id)
       const value = mutate(draft)
-      await store(sid, current, draft, placeholder)
+      await commit([current, draft])
+      if (placeholder) Object.assign(placeholder.part, { text: "", synthetic: true, ignored: true })
       return value
     })
 
@@ -371,16 +366,17 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const latest = async (sid: string): Promise<Info | undefined> => {
     const result = await client.session.messages({ path: { id: sid }, query: { limit: 100 } }).catch((error) => {
       console.warn("QueuePlugin could not inspect session messages for queued placeholder metadata", error)
-      return []
+      return undefined
     })
 
-    return ([...(Array.isArray(result) ? result : (result.data ?? []))].reverse() as Msg[]).flatMap((msg): Info[] => {
-      if (msg.info.role === "user" && msg.info.agent && msg.info.model) return [{ agent: msg.info.agent, model: msg.info.model, variant: msg.info.variant }]
-      if (msg.info.role === "assistant" && (msg.info.agent || msg.info.mode) && msg.info.providerID && msg.info.modelID) {
-        return [{ agent: msg.info.agent ?? msg.info.mode!, model: { providerID: msg.info.providerID, modelID: msg.info.modelID }, variant: msg.info.variant }]
+    const messages = (result?.data ?? []) as Msg[]
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const { info } = messages[i]
+      if (info.role === "user" && info.agent && info.model) return { agent: info.agent, model: info.model, variant: info.variant }
+      if (info.role === "assistant" && (info.agent || info.mode) && info.providerID && info.modelID) {
+        return { agent: info.agent ?? info.mode!, model: { providerID: info.providerID, modelID: info.modelID }, variant: info.variant }
       }
-      return []
-    })[0]
+    }
   }
 
   const run = async (sid: string): Promise<Run> => {
@@ -416,7 +412,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     }
   }
 
-  const replay = async (sid: string, item: Item) => {
+  const replay = async (sid: string, item: ReplayItem) => {
     switch (item.kind) {
       case "shell":
         return shell(sid, item.shell, item.info)
@@ -447,98 +443,163 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const advance = (sid: string) => {
     if (deleted.has(sid)) return
     const current = state(sid)
-    if (current.activity.kind !== "idle" || current.stopped || current.failed || !current.items.length) return
-    void flush(sid, 1).catch(async (error) => {
+    if (!canAdvance(current)) return
+    void afterEnqueue(sid, () => flush(sid, "next")).catch(async (error) => {
       console.error("QueuePlugin could not advance the persisted queue", error)
       await toast(`Queue persistence failed: ${error instanceof Error ? error.message : String(error)}`, "error", 5000)
     })
   }
 
-  const idle = (sid: string) => {
-    const current = state(sid)
-    if (current.activity.kind === "sending") {
-      current.activity.idle = true
-      return
-    }
-    if (current.activity.kind !== "busy") return
-    current.activity = { kind: "idle" }
-    if (!current.failed) advance(sid)
+  const enqueue = async (sid: string, item: Item, front: boolean, placeholder?: Placeholder) => {
+    await persist(sid, placeholder, (draft) => {
+      if (front) draft.items.unshift(item)
+      else draft.items.push(item)
+    })
+    advance(sid)
+    await toast(`${front ? "Queued first" : "Queued"}: ${itemText(item)}`, "info")
   }
 
-  const flush = async (sid: string, count = Infinity, placeholder?: Placeholder) => {
+  const idle = (sid: string) => {
+    const current = state(sid)
+    const previous = current.activity.kind
+    if (previous === "restored" && !current.flight) return
+    current.activity = { kind: "idle" }
+    if (previous === "busy") advance(sid)
+  }
+
+  const carry = async (sid: string, current: State, carrying: Carrying) => {
+    const eligible = () => !deleted.has(sid) && !current.failed && !(carrying.automatic && current.stopped) && current.items[0] === carrying.item
+    let destination: string | undefined
+    try {
+      if (!carrying.automatic) {
+        const observed = current.activity
+        const result = await client.session.status({ query: { directory }, throwOnError: true })
+        // Live events received during the request take precedence over its snapshot.
+        if (current.activity === observed) current.activity = { kind: !result.data[sid] || result.data[sid].type === "idle" ? "idle" : "busy" }
+      }
+      if (current.activity.kind !== "idle") return "Queue is waiting for carry; the session must finish before continuing in a new session"
+      if (!eligible()) return "Carry deferred because the queue or session changed"
+      const created = await client.session.create({ query: { directory }, throwOnError: true })
+      const nextID = created.data.id
+      destination = await afterEnqueue(sid, () => serialize(async () => {
+        if (deleted.has(nextID) || !eligible() || current.activity.kind !== "idle") return undefined
+        if (current.flight !== carrying) throw new Error(`QueuePlugin lost track of carry for session ${sid}`)
+
+        const next = state(nextID)
+        const source: Draft = { items: [], stopped: current.stopped, hidden: current.hidden }
+        const target: Draft = { items: current.items.slice(1), stopped: current.stopped, hidden: next.hidden }
+        await commit([current, source], [next, target])
+        return nextID
+      }))
+    } catch (error) {
+      current.failed = true
+      console.error("QueuePlugin failed to carry queued input", error)
+      await toast(`Queue carry failed: ${error instanceof Error ? error.message : String(error)}`, "error", 5000)
+      return "Queue carry failed; queued entries were kept for retry"
+    } finally {
+      current.flight = undefined
+      if (!destination) advance(sid)
+    }
+
+    if (!destination) return "Carry deferred because the queue or session changed"
+
+    // The v1 plugin SDK has no selectSession method; use its authenticated client.
+    try {
+      if (!post) throw new Error("the SDK client has no internal request method")
+      const result = await post({ url: "/tui/select-session", body: { sessionID: destination }, headers: { "Content-Type": "application/json" } })
+      if (!result?.response?.ok) throw new Error(`TUI selection failed: ${JSON.stringify(result?.error ?? result?.response?.status)}`)
+    } catch (error) {
+      console.warn("QueuePlugin carried the queue but could not select the new session", error)
+      await toast(`Queue carried to ${destination}, but the TUI could not switch sessions`, "error", 5000)
+    }
+    advance(destination)
+    return "Carried queue to a new session"
+  }
+
+  const flush = async (sid: string, mode: "next" | "all", placeholder?: Placeholder) => {
+    const automatic = mode === "next"
+    if (placeholder) await persist(sid, placeholder, () => undefined)
     const reservation = await serialize(async () => {
       if (deleted.has(sid)) return undefined
       const current = state(sid)
-      if (count === 1 && (current.activity.kind !== "idle" || current.stopped || current.failed)) return undefined
+      if (automatic && !canAdvance(current)) return undefined
 
-      const items = current.items.slice(0, count)
-      if (placeholder) {
-        const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden).add(placeholder.id) }
-        await store(sid, current, draft, placeholder)
-        if (deleted.has(sid)) return undefined
+      if (current.flight?.kind === "carrying" || (current.items[0]?.kind === "carry" && current.flight)) {
+        return "Queue is waiting for carry; the session must finish before continuing in a new session"
+      }
+      if (current.items[0]?.kind === "carry") {
+        const carrying: Carrying = { kind: "carrying", item: current.items[0], automatic }
+        if (!automatic) current.failed = false
+        current.flight = carrying
+        return { kind: "carry", current, carrying } as const
+      }
+      const items: ReplayItem[] = []
+      for (const item of current.items) {
+        if (item.kind === "carry") break
+        items.push(item)
+        if (automatic) break
       }
       if (!items.length) return undefined
-      if (count !== 1) current.failed = false
+      if (!automatic) current.failed = false
 
       // Prompt requests stay pending until the agent finishes; new flushes can still steer it.
-      const sending: Extract<Activity, { kind: "sending" }> = current.activity.kind === "sending"
-        ? current.activity
-        : { kind: "sending", idle: false, batches: [] }
+      if (!current.flight) current.activity = { kind: "busy" }
+      const sending: Sending = current.flight ?? { kind: "sending", batches: [] }
       const batch = { items, pending: true }
       sending.batches.push(batch)
       current.items.splice(0, items.length)
-      current.activity = sending
-      return { current, items, sending, batch }
+      current.flight = sending
+      return { kind: "send", current, items, sending, batch } as const
     })
 
-    if (!reservation) return { sent: 0, failed: 0 }
+    if (!reservation) return "Queue is empty"
+    if (typeof reservation === "string") return reservation
+    if (reservation.kind === "carry") return carry(sid, reservation.current, reservation.carrying)
 
     const { current, items, sending, batch } = reservation
     const retry = (await Promise.all(
       items.map(async (item) => {
         try {
           await replay(sid, item)
-          return []
+          return undefined
         } catch (error) {
           console.error("QueuePlugin failed to flush queued input", error)
           await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
-          return [item]
+          return item
         }
       }),
-    )).flat()
+    )).filter((item) => item !== undefined)
     await serialize(async () => {
       if (sessions.get(sid) !== current) return
-      if (current.activity !== sending || !batch.pending || !sending.batches.includes(batch)) throw new Error(`QueuePlugin lost track of in-flight queued items for session ${sid}`)
+      if (current.flight !== sending || !batch.pending || !sending.batches.includes(batch)) throw new Error(`QueuePlugin lost track of in-flight queued items for session ${sid}`)
 
       batch.pending = false
       batch.items = retry
       if (retry.length) current.failed = true
       try {
-        await save()
+        await commit()
       } catch (error) {
         batch.items = items
         current.failed = true
-        console.error("QueuePlugin failed to persist queues", error)
         throw error
       } finally {
         if (!sending.batches.some((entry) => entry.pending)) {
           const queued = sending.batches.flatMap((entry) => entry.items)
           current.items.unshift(...queued)
-          current.activity = { kind: sending.idle || queued.length ? "idle" : "busy" }
+          if (queued.length) current.activity = { kind: "idle" }
+          current.flight = undefined
         }
       }
     })
     advance(sid)
-    return { sent: items.length - retry.length, failed: retry.length }
+    const sent = items.length - retry.length
+    const message = `Flushed ${sent} queued item${sent === 1 ? "" : "s"}`
+    return retry.length ? `${message}; ${retry.length} failed` : message
   }
 
   const manage = async (sid: string, op: ControlOp, placeholder?: Placeholder) => {
-    if (op.kind === "flush") {
-      const result = await flush(sid, Infinity, placeholder)
-      if (!result.sent && !result.failed) return "Queue is empty"
-      const message = `Flushed ${result.sent} queued item${result.sent === 1 ? "" : "s"}`
-      return result.failed ? `${message}; ${result.failed} failed` : message
-    }
+    if (op.kind === "flush") return flush(sid, "all", placeholder)
+    if (op.kind === "list" && !placeholder) return serialize(async () => describeQueue(sessions.get(sid)))
 
     if (op.kind === "always") {
       const enabled = await serialize(async () => {
@@ -552,10 +613,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
     const message = await persist(sid, placeholder, (draft) => {
       switch (op.kind) {
-        case "list": {
-          const list = draft.items.map((item, i) => `${i + 1}. ${itemText(item)}`).join("\n") || "Queue is empty"
-          return draft.stopped ? `${list}\nQueue is stopped` : list
-        }
+        case "list":
+          return describeQueue(draft)
         case "clear":
           return clear(draft.items, op.indices)
         case "stop":
@@ -603,12 +662,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         if (deleted.has(sid) && !sessions.has(sid)) return
         deleted.add(sid)
         await serialize(async () => {
-          try {
-            await save(sid)
-          } catch (error) {
-            console.error("QueuePlugin failed to persist queues", error)
-            throw error
-          }
+          await commit()
           sessions.delete(sid)
         })
         return
@@ -626,12 +680,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       if (deleted.has(sid)) return
       const current = state(sid)
       if (event.properties.status.type !== "idle") {
-        if (current.activity.kind === "sending") {
-          current.activity.idle = false
-        } else {
-          current.activity = { kind: "busy" }
-          current.failed = false
-        }
+        current.activity = { kind: "busy" }
+        if (!current.flight) current.failed = false
         return
       }
 
@@ -667,6 +717,10 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
       if (control(op)) return stop(await afterEnqueue(sid, () => manage(sid, op)))
       if (op.kind === "invalid") return stop(op.message, "error")
+      if (op.kind === "carry") {
+        await orderedEnqueue(sid, () => enqueue(sid, { kind: "carry" }, op.front))
+        return handled()
+      }
 
       if (!shouldQueue(sessions.get(sid)) || (request.modifier === "now" && op.kind !== "prompt" && op.kind !== "shell")) {
         if (op.kind === "shell") {
@@ -724,7 +778,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         return
       }
 
-      if ((request.modifier === "now" && op.kind !== "shell") || !shouldQueue(current)) {
+      if (op.kind !== "carry" && ((request.modifier === "now" && op.kind !== "shell") || !shouldQueue(current))) {
         if (op.kind === "command") return
         if (op.kind === "compact") {
           await persist(sid, placeholder, () => undefined)
@@ -753,7 +807,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         if (prior) Object.assign(output.message, opts(prior))
         else console.warn("QueuePlugin could not neutralize queued placeholder metadata because the session has no previous message context")
         let item: Item
-        if (op.kind === "shell") item = { kind: "shell", info, source: op.source, shell: op.shell }
+        if (op.kind === "carry") item = { kind: "carry" }
+        else if (op.kind === "shell") item = { kind: "shell", info, source: op.source, shell: op.shell }
         else if (op.kind === "compact") item = { kind: "compact", info, source: op.source }
         else if (op.kind === "command") item = { kind: "command", info, source: op.source, cmd: op.cmd, args: op.args, files: parts }
         else {
@@ -770,12 +825,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
           }
         }
 
-        await persist(sid, placeholder, (draft) => {
-          if (op.front) draft.items.unshift(item)
-          else draft.items.push(item)
-        })
-        advance(sid)
-        await toast(`${op.front ? "Queued first" : "Queued"}: ${itemText(item)}`, "info")
+        await enqueue(sid, item, op.front, placeholder)
       })
     },
     "experimental.chat.messages.transform": async (_, output) => {

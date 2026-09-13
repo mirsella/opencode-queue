@@ -40,6 +40,9 @@ do this next /queue front
 /queue !ls
 /queue front !pwd
 
+/queue carry
+/queue start the next task in a fresh session
+
 /queue list
 /queue stop
 /queue start
@@ -68,6 +71,8 @@ do this next /queue front
 | `/queue front /compact` | Queue OpenCode's built-in TUI `/compact` command before existing queued entries. |
 | `/queue !ls` | Queue an OpenCode shell block. |
 | `/queue front !ls` | Queue an OpenCode shell block before existing queued entries. |
+| `/queue carry` | Queue a boundary that moves the remaining queue to a fresh session. |
+| `/queue front carry` | Put a fresh-session boundary before existing queued entries. |
 | `/queue` | Show the current queue. |
 | `/queue list` | Show the current queue. |
 | `/queue stop` | Pause automatic sending of queued entries. |
@@ -75,7 +80,7 @@ do this next /queue front
 | `/queue always` | Show whether automatic queueing is enabled globally. |
 | `/queue always on` | Enable automatic queueing in every project. |
 | `/queue always off` | Disable automatic queueing in every project. |
-| `/queue flush` | Send all queued entries immediately. |
+| `/queue flush` | Send waiting entries immediately, up to the next carry boundary. |
 | `/queue clear` | Clear the current queue. |
 | `/queue clear 1` | Clear item 1 from the current queue. |
 | `/queue clear 2 3` | Clear items 2 and 3 from the current queue. |
@@ -94,7 +99,7 @@ When the session is busy:
 - Queued entries are kept in place after an error, abort, crash, or restart.
 - `/queue stop` pauses automatic replay without clearing queued entries, and `/queue start` resumes it.
 - `/queue always on` also queues plain prompts and custom slash commands while the session is busy, paused, or already has queued work. OpenCode does not expose native shell or `/compact` submissions to these plugin hooks.
-- `/queue flush` submits all waiting entries immediately, even while a previous replay is still running. Prompts appear in the conversation as normal steering messages with OpenCode's queued indicator; the current run is not aborted and already-submitted entries are not resent.
+- `/queue flush` submits waiting entries up to the next carry boundary immediately, even while a previous replay is still running. Prompts appear in the conversation as normal steering messages with OpenCode's queued indicator; the current run is not aborted and already-submitted entries are not resent.
 
 When the session is idle:
 
@@ -106,10 +111,42 @@ When the session is idle:
 - `/queue !ls` runs `ls` immediately as an OpenCode shell block.
 - `/queue` and `/queue list` show the current queue.
 - `/queue stop` pauses automatic replay, and `/queue start` resumes it.
-- `/queue flush` sends all queued entries immediately in one batch.
+- `/queue flush` sends queued entries up to the next carry boundary in one batch.
 - `/queue clear` clears the current queue, and `/queue clear 1` clears a specific queued item.
 
 Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. The `always` setting applies to every OpenCode project. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+
+## Carry between sessions
+
+`/queue carry` adds a fresh-session boundary to the queue. When it reaches the front and the current session finishes, the plugin creates a new session in the same directory, moves all remaining entries there, and switches the TUI to it. The new session starts with an empty conversation. Each entry keeps its selected agent, model, thinking variant, and attachments.
+
+For example, while the first task is running:
+
+```text
+/queue finish the first task
+/queue carry
+/queue implement the second task
+/queue carry
+/queue implement the third task
+```
+
+`/queue list` shows every boundary, with item numbers shared across the whole queue:
+
+```text
+1. finish the first task
+2. --- carry: new session 1 ---
+3. implement the second task
+4. --- carry: new session 2 ---
+5. implement the third task
+```
+
+Use `/queue clear 2` to remove the first boundary and run the second task in the current session instead. `/queue front carry` moves all waiting work to a fresh session after the current run finishes. Trailing syntax, such as `carry /q`, also works.
+
+The previous session's queue becomes empty after the transfer. Boundaries survive restarts along with the rest of the queue. A failed session creation or transfer leaves the source queue intact for retry with `/queue start` or `/queue flush`.
+
+`/queue flush` respects session boundaries. It sends only the entries before the next carry, which waits for the current run and any in-flight replays to finish. Automatic replay then continues one entry at a time in the new session. A stopped queue stays stopped when carried. An idle carry with nothing after it opens an empty session. Consecutive carries each open a fresh session.
+
+Carry does not accept attachments, and `/queue now carry` is rejected because carry must wait for the current session to finish.
 
 ## Notes
 
