@@ -136,6 +136,30 @@ isolated("registers dedicated commands and retains q for ordinary input", async 
   assert.equal(await list(hooks), "1. first\n2. last\n3. front page is unreachable\n4. trailing")
 })
 
+isolated("bare queue and q show the queue through both input paths", async () => {
+  const hooks = await plugin()
+  const empty = output("empty", "/queue")
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, empty)
+  assert.equal(hooks.toasts.at(-1), "Queue is empty")
+  assert.equal(empty.parts[0].ignored, true)
+
+  await busy(hooks)
+  await chat(hooks, "item", "/queue first")
+  const command = output("command", "")
+  await assert.rejects(
+    hooks["command.execute.before"]({ sessionID: "session", command: "queue", arguments: "" }, command),
+    (response) => response.status === 204,
+  )
+  assert.equal(hooks.toasts.at(-1), "1. first")
+  await chat(hooks, "alias", "/q")
+  assert.equal(hooks.toasts.at(-1), "1. first")
+
+  const attachment = output("attachment", "/queue")
+  attachment.parts.push({ type: "file", mime: "text/plain", url: "file:///notes.txt" })
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, attachment)
+  assert.equal(await list(hooks), "1. first\n2. 1 attachment")
+})
+
 isolated("old control words are literal input and dedicated controls reject extra input", async () => {
   const hooks = await plugin()
   await busy(hooks)

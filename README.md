@@ -23,6 +23,7 @@ Restart OpenCode after installing. OpenCode installs npm plugins automatically a
 ## Quick examples
 
 ```text
+/queue
 /q continue after this task
 continue after this task /queue
 /queue:front do this next
@@ -47,6 +48,7 @@ continue after this task /queue
 
 | Input | What it does |
 | --- | --- |
+| `/queue` or `/q` | Show the current queue. |
 | `/queue message` | Queue a normal prompt. |
 | `message /queue` | Queue a normal prompt using trailing syntax. |
 | `/queue:front message` | Queue a normal prompt before existing queued entries. |
@@ -71,7 +73,7 @@ continue after this task /queue
 | `/queue:clear 1` | Clear item 1 from the current queue, whether it is input or a carry boundary. |
 | `/queue:clear 2 3` | Clear items 2 and 3 from the current queue. |
 
-Words after `/queue` and `/q` are always input, not controls. For example, `/queue front page is unreachable` queues the whole phrase. Use `/queue:list` to inspect the queue.
+Words after `/queue` and `/q` are always input, not controls. For example, `/queue front page is unreachable` queues the whole phrase. Use bare `/queue` or `/queue:list` to inspect the queue.
 
 ## Behavior
 
@@ -89,7 +91,7 @@ When the session is busy:
 - `/queue:always-on` also queues plain prompts and custom slash commands while the session is busy, paused, or already has queued work. OpenCode does not expose native shell or `/compact` submissions to these plugin hooks.
 - `/queue:flush` submits waiting entries up to the next carry boundary immediately, even while a previous replay is still running. Prompts appear in the conversation as normal steering messages with OpenCode's queued indicator; the current run is not aborted and already-submitted entries are not resent.
 
-When the session is idle, `/queue` input runs immediately. Queue controls work whether the session is idle or busy.
+When the session is idle, `/queue` input runs immediately. Bare `/queue` and queue controls work whether the session is idle or busy.
 
 Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. The `always` setting applies to every OpenCode project. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
 

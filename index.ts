@@ -20,8 +20,8 @@ type Msg = { info: { role: string; agent?: string; mode?: string; model?: Model;
 type Ask = { type: string; properties: { id: string; sessionID: string; questions: { question: string; header: string }[] } }
 type Post = (input: { url: string; path?: Record<string, string>; body?: unknown; headers?: Record<string, string> }) => Promise<{ response?: Response; error?: unknown } | undefined>
 const COMMANDS = {
-  q: "Queue input until the session is idle",
-  queue: "Queue input until the session is idle",
+  q: "Queue input or show the current queue",
+  queue: "Queue input or show the current queue",
   "queue:front": "Put input at the front of the queue",
   "queue:now": "Send input immediately, except shell commands",
   "queue:carry": "Continue the queue in a new session",
@@ -110,6 +110,8 @@ const parse = (input: QueueInput, files: number): Op => {
       }
     case "q":
     case "queue":
+      if (!text && !files) return { kind: "list" }
+      break
     case "queue:front":
     case "queue:now":
       break
@@ -143,7 +145,6 @@ const parseSuffix = (text: string): QueueInput | undefined => {
   const match = text.match(SUFFIX)
   return match ? { body: match[1] ?? "", command: match[2] as "q" | "queue" } : undefined
 }
-const stripSuffix = (text: string) => parseSuffix(text)?.body ?? text
 const parseInput = (text: string): QueueInput | undefined => {
   const prefix = text.match(CMD)
   return prefix && isQueue(prefix[1]) ? { body: prefix[2] ?? "", command: prefix[1] } : parseSuffix(text)
@@ -725,7 +726,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         if (!trailing && !(await automaticallyQueue(sid))) return
 
         if (!shouldQueue(sessions.get(sid))) {
-          if (trailing) for (const part of output.parts) if (part.type === "text") part.text = stripSuffix(part.text)
+          if (trailing) for (const part of output.parts) if (part.type === "text") part.text = parseSuffix(part.text)?.body ?? part.text
           return
         }
 
