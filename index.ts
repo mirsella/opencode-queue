@@ -6,7 +6,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
-const SUFFIX = /^(?:([\s\S]*?)\s+)?\/(\S+)(?:\s+(front))?\s*$/
+const SUFFIX = /^(?:([\s\S]*?)\s+)?\/(q|queue)\s*$/
 const CMD = /^\/(\S+)(?:\s+([\s\S]*))?$/
 const ITEM_NUMBER = /^[1-9]\d*$/
 const TUI_COMPACT = "session_compact"
@@ -19,7 +19,24 @@ type Info = { agent: string; model: Model; variant?: string }
 type Msg = { info: { role: string; agent?: string; mode?: string; model?: Model; providerID?: string; modelID?: string; variant?: string } }
 type Ask = { type: string; properties: { id: string; sessionID: string; questions: { question: string; header: string }[] } }
 type Post = (input: { url: string; path?: Record<string, string>; body?: unknown; headers?: Record<string, string> }) => Promise<{ response?: Response; error?: unknown } | undefined>
-type QueueInput = { body: string; modifier?: "front" | "now" }
+const COMMANDS = {
+  q: "Queue input until the session is idle",
+  queue: "Queue input until the session is idle",
+  "queue:front": "Put input at the front of the queue",
+  "queue:now": "Send input immediately, except shell commands",
+  "queue:carry": "Continue the queue in a new session",
+  "queue:carry-front": "Put a new-session boundary at the front of the queue",
+  "queue:list": "Show queued input",
+  "queue:clear": "Clear the queue or selected item numbers",
+  "queue:flush": "Send waiting entries immediately",
+  "queue:start": "Resume automatic queue replay",
+  "queue:stop": "Pause automatic queue replay",
+  "queue:always": "Show the global automatic queue setting",
+  "queue:always-on": "Enable automatic queueing globally",
+  "queue:always-off": "Disable automatic queueing globally",
+} as const
+type QueueCommand = keyof typeof COMMANDS
+type QueueInput = { body: string; command: QueueCommand }
 
 type ReplayItem =
   | { kind: "prompt"; info: Info; body: string; parts: InputPart[] }
@@ -54,55 +71,58 @@ type Placeholder = { id: string; part: TextPart }
 type Op =
   | ControlOp
   | { kind: "invalid"; message: string }
-  | (EntryOp & { front: boolean })
+  | EntryOp
 
-const isQueue = (command: string) => command === "q" || command === "queue"
+const isQueue = (command: string): command is QueueCommand => Object.hasOwn(COMMANDS, command)
+const isFront = (command: QueueCommand) => command === "queue:front" || command === "queue:carry-front"
 
-const parsePrefix = (body: string): QueueInput => {
-  const match = body.trim().match(/^(front|now)(?:\s+([\s\S]*))?$/)
-  return match ? { body: match[2] ?? "", modifier: match[1] === "front" ? "front" : "now" } : { body }
-}
-
-const parse = (input: QueueInput, files = 0): Op => {
+const parse = (input: QueueInput, files: number): Op => {
   const text = input.body.trim()
-  const front = input.modifier === "front"
-  if (text === "carry") {
-    if (files) return { kind: "invalid", message: "Queue carry does not support attachments" }
-    if (input.modifier === "now") return { kind: "invalid", message: "Queue carry must wait until the session is idle" }
-    return { kind: "carry", front }
-  }
-  if (!input.modifier && !files) {
-    switch (text) {
-      case "":
-      case "list":
-        return { kind: "list" }
-      case "flush":
-        return { kind: "flush" }
-      case "start":
-        return { kind: "start" }
-      case "stop":
-        return { kind: "stop" }
-    }
-
-    if (text === "always") return { kind: "always" }
-    if (text === "always on" || text === "always off") return { kind: "always", enabled: text === "always on" }
-    if (/^always(?:\s|$)/.test(text)) return { kind: "invalid", message: "Queue always expects on or off" }
-
-    const clear = text.match(/^clear(?:\s+([\s\S]+))?$/)
-    if (clear) {
-      const values = clear[1]?.trim().split(/\s+/) ?? []
+  switch (input.command) {
+    case "queue:carry":
+    case "queue:carry-front":
+      if (text) return { kind: "invalid", message: "Queue carry does not accept arguments" }
+      if (files) return { kind: "invalid", message: "Queue carry does not support attachments" }
+      return { kind: "carry" }
+    case "queue:clear": {
+      if (files) return { kind: "invalid", message: "Queue clear does not support attachments" }
+      const values = text ? text.split(/\s+/) : []
       const indices = values.map(Number)
       if (values.some((value) => !ITEM_NUMBER.test(value)) || indices.some((index) => !Number.isSafeInteger(index))) return { kind: "invalid", message: "Queue clear expects one or more positive item numbers" }
       return { kind: "clear", indices }
     }
+    case "queue:list":
+    case "queue:flush":
+    case "queue:start":
+    case "queue:stop":
+    case "queue:always":
+    case "queue:always-on":
+    case "queue:always-off":
+      if (text || files) return { kind: "invalid", message: `Queue ${input.command.slice(6)} does not accept input` }
+      switch (input.command) {
+        case "queue:list": return { kind: "list" }
+        case "queue:flush": return { kind: "flush" }
+        case "queue:start": return { kind: "start" }
+        case "queue:stop": return { kind: "stop" }
+        case "queue:always": return { kind: "always" }
+        case "queue:always-on": return { kind: "always", enabled: true }
+        case "queue:always-off": return { kind: "always", enabled: false }
+      }
+    case "q":
+    case "queue":
+    case "queue:front":
+    case "queue:now":
+      break
+    default:
+      input.command satisfies never
   }
-  if (input.modifier && !text && !files) return { kind: "invalid", message: `Queue ${input.modifier} input is empty` }
+  if (!text && !files) return { kind: "invalid", message: "Queue input is empty" }
 
   if (text.startsWith("!")) {
     const shell = text.slice(1).trim()
     if (!shell) return { kind: "invalid", message: "Queue shell command is empty" }
     if (files) return { kind: "invalid", message: "Queued shell commands do not support attachments" }
-    return { kind: "shell", source: text, shell, front }
+    return { kind: "shell", source: text, shell }
   }
 
   const match = text.match(CMD)
@@ -112,21 +132,21 @@ const parse = (input: QueueInput, files = 0): Op => {
     if (cmd === "compact") {
       if (args.trim()) return { kind: "invalid", message: "Queue compact does not accept arguments" }
       if (files) return { kind: "invalid", message: "Queue compact does not support attachments" }
-      return { kind: "compact", source: text, front }
+      return { kind: "compact", source: text }
     }
-    return { kind: "command", source: text, cmd, args, front }
+    return { kind: "command", source: text, cmd, args }
   }
-  return { kind: "prompt", body: input.body, front }
+  return { kind: "prompt", body: input.body }
 }
 
 const parseSuffix = (text: string): QueueInput | undefined => {
   const match = text.match(SUFFIX)
-  return match && isQueue(match[2]) ? { body: match[1] ?? "", modifier: match[3] ? "front" : undefined } : undefined
+  return match ? { body: match[1] ?? "", command: match[2] as "q" | "queue" } : undefined
 }
 const stripSuffix = (text: string) => parseSuffix(text)?.body ?? text
 const parseInput = (text: string): QueueInput | undefined => {
   const prefix = text.match(CMD)
-  return prefix && isQueue(prefix[1]) ? parsePrefix(prefix[2] ?? "") : parseSuffix(text)
+  return prefix && isQueue(prefix[1]) ? { body: prefix[2] ?? "", command: prefix[1] } : parseSuffix(text)
 }
 const control = (op: Op): op is ControlOp => {
   switch (op.kind) {
@@ -142,6 +162,8 @@ const control = (op: Op): op is ControlOp => {
   }
 }
 const shouldQueue = (state?: State) => Boolean(state && (state.flight || state.activity.kind !== "idle" || state.stopped || state.items.length))
+const sendNow = (state: State | undefined, command: QueueCommand, op: EntryOp) =>
+  op.kind !== "carry" && ((command === "queue:now" && op.kind !== "shell") || !shouldQueue(state))
 const canAdvance = (state: State) => !state.flight && state.activity.kind === "idle" && !state.stopped && !state.failed && state.items.length > 0
 const shouldDeclinePlan = (state?: State) => Boolean(state && (state.flight?.kind === "sending" || (!state.stopped && state.items.length)))
 const itemText = (item: Item) => {
@@ -344,7 +366,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     if (!result?.response?.ok) console.warn("QueuePlugin failed to answer plan prompt", result?.error ?? result?.response?.status)
   }
 
-  const files = (parts: { type: string }[]) => parts.filter((part): part is FilePart => part.type === "file").map((part) => ({ ...part }))
+  const files = (parts: { type: string }[]) => parts.filter((part): part is FilePart => part.type === "file")
 
   const clear = (list: Item[], indices: number[]) => {
     if (!list.length) return "Queue is empty"
@@ -635,7 +657,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const hooks: Awaited<ReturnType<Plugin>> = {
     config: async (cfg) => {
       cfg.command ??= {}
-      cfg.command.q = cfg.command.queue = { template: "", description: "Queue input until the session is idle" }
+      for (const [name, description] of Object.entries(COMMANDS)) cfg.command[name] = { template: "", description }
     },
     event: async ({ event }) => {
       if (plan(event)) {
@@ -690,7 +712,6 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     "command.execute.before": async (input, output) => {
       const sid = input.sessionID
       const body = input.arguments ?? ""
-      const parts = files(output.parts)
 
       const internal = internalCommands.find((pending) => !pending.used && pending.sid === sid && pending.command === input.command && pending.args === body)
       if (internal) {
@@ -700,29 +721,31 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       }
 
       if (!isQueue(input.command)) {
-        const queued = parseSuffix(body) ?? ((await automaticallyQueue(sid)) ? { body } : undefined)
-        if (!queued) return
+        const trailing = parseSuffix(body)
+        if (!trailing && !(await automaticallyQueue(sid))) return
 
         if (!shouldQueue(sessions.get(sid))) {
-          for (const part of output.parts) if (part.type === "text") part.text = stripSuffix(part.text)
+          if (trailing) for (const part of output.parts) if (part.type === "text") part.text = stripSuffix(part.text)
           return
         }
 
-        output.parts.splice(0, output.parts.length, { type: "text", text: `/queue${queued.modifier === "front" ? " front" : ""} /${input.command}${queued.body.trim() ? ` ${queued.body.trim()}` : ""}` } as any, ...parts)
+        const args = (trailing?.body ?? body).trim()
+        output.parts.splice(0, output.parts.length, { type: "text", text: `/queue /${input.command}${args ? ` ${args}` : ""}` } as any, ...files(output.parts))
         return
       }
 
-      const request = parsePrefix(body)
+      const request: QueueInput = { body, command: input.command }
+      const parts = files(output.parts)
       const op = parse(request, parts.length)
 
       if (control(op)) return stop(await afterEnqueue(sid, () => manage(sid, op)))
       if (op.kind === "invalid") return stop(op.message, "error")
       if (op.kind === "carry") {
-        await orderedEnqueue(sid, () => enqueue(sid, { kind: "carry" }, op.front))
+        await orderedEnqueue(sid, () => enqueue(sid, { kind: "carry" }, isFront(request.command)))
         return handled()
       }
 
-      if (!shouldQueue(sessions.get(sid)) || (request.modifier === "now" && op.kind !== "prompt" && op.kind !== "shell")) {
+      if (sendNow(sessions.get(sid), request.command, op)) {
         if (op.kind === "shell") {
           await shell(sid, op.shell, await run(sid))
           return handled()
@@ -739,10 +762,11 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         }
 
         output.parts.splice(0, output.parts.length, { type: "text", text: op.body } as any, ...parts)
+        if (request.command === "queue:now") markInternal(output.parts)
         return
       }
 
-      output.parts.splice(0, output.parts.length, { type: "text", text: `/queue ${body}` } as any, ...parts)
+      output.parts.splice(0, output.parts.length, { type: "text", text: `/${request.command} ${body}` } as any, ...parts)
     },
     "chat.message": async (input, output) => {
       const sid = input.sessionID
@@ -758,10 +782,10 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       const text = output.parts.find((part): part is TextPart => part.type === "text" && !part.synthetic)
       if (!text) return
 
-      const request = parseInput(text.text) ?? ((await automaticallyQueue(sid)) ? { body: text.text } : undefined)
+      const request = parseInput(text.text) ?? ((await automaticallyQueue(sid)) ? { body: text.text, command: "queue" as const } : undefined)
       if (!request) return
 
-      const current = state(sid)
+      const current = sessions.get(sid)
       const parts = files(output.parts)
       const op = parse(request, parts.length)
       const info = { agent: input.agent ?? output.message.agent, model: input.model ?? output.message.model, variant: input.variant }
@@ -778,7 +802,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         return
       }
 
-      if (op.kind !== "carry" && ((request.modifier === "now" && op.kind !== "shell") || !shouldQueue(current))) {
+      if (sendNow(current, request.command, op)) {
         if (op.kind === "command") return
         if (op.kind === "compact") {
           await persist(sid, placeholder, () => undefined)
@@ -810,7 +834,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         if (op.kind === "carry") item = { kind: "carry" }
         else if (op.kind === "shell") item = { kind: "shell", info, source: op.source, shell: op.shell }
         else if (op.kind === "compact") item = { kind: "compact", info, source: op.source }
-        else if (op.kind === "command") item = { kind: "command", info, source: op.source, cmd: op.cmd, args: op.args, files: parts }
+        else if (op.kind === "command") item = { kind: "command", info, source: op.source, cmd: op.cmd, args: op.args, files: parts.map((part) => ({ ...part })) }
         else {
           item = {
             kind: "prompt",
@@ -825,7 +849,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
           }
         }
 
-        await enqueue(sid, item, op.front, placeholder)
+        await enqueue(sid, item, isFront(request.command), placeholder)
       })
     },
     "experimental.chat.messages.transform": async (_, output) => {

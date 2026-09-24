@@ -54,7 +54,7 @@ const chat = (hooks, id, text, sessionID = "session") => hooks["chat.message"]({
 const busy = (hooks, sessionID = "session") => hooks.event({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } })
 const idle = (hooks, sessionID = "session") => hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
 const list = async (hooks, sessionID = "session") => {
-  await chat(hooks, `list-${sessionID}`, "/queue list", sessionID)
+  await chat(hooks, `list-${sessionID}`, "/queue:list", sessionID)
   return hooks.toasts.at(-1)
 }
 
@@ -74,7 +74,7 @@ const isolated = (name, run) =>
 
 isolated("restores queued items and stopped state after restart", async () => {
   const first = await plugin()
-  await chat(first, "stop", "/queue stop")
+  await chat(first, "stop", "/queue:stop")
   await chat(first, "queued", "/queue survive restart")
 
   const second = await plugin()
@@ -83,50 +83,124 @@ isolated("restores queued items and stopped state after restart", async () => {
   await second["experimental.chat.messages.transform"]({}, transformed)
   assert.deepEqual(transformed.messages.map((message) => message.info.id), ["other"])
 
-  await chat(second, "clear", "/queue clear")
+  await chat(second, "clear", "/queue:clear")
   const third = await plugin()
   assert.equal(await list(third), "Queue is empty\nQueue is stopped")
 })
 
 isolated("persists global always mode and bypasses it with now", async () => {
   const first = await plugin()
-  await chat(first, "always-on", "/queue always on")
+  await chat(first, "always-on", "/queue:always-on")
   const hooks = await plugin({}, "other-project")
-  await chat(hooks, "always-status", "/queue always")
+  await chat(hooks, "always-status", "/queue:always")
   assert.equal(hooks.toasts.at(-1), "Always queue is on globally")
   await busy(hooks)
   await chat(hooks, "plain", "queue without the command")
 
   const immediate = output("now", "")
-  await hooks["command.execute.before"]({ sessionID: "session", command: "q", arguments: "now send immediately" }, immediate)
+  await hooks["command.execute.before"]({ sessionID: "session", command: "queue:now", arguments: "send immediately" }, immediate)
   await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, immediate)
   assert.equal(immediate.parts[0].text, "send immediately")
   assert.equal(await list(hooks), "1. queue without the command")
 
-  await chat(hooks, "now-shell", "/queue now !pwd")
+  await chat(hooks, "now-shell", "/queue:now !pwd")
   assert.equal(await list(hooks), "1. queue without the command\n2. !pwd")
 
   const queuedCommand = { parts: [{ type: "text", text: "changes" }] }
   await hooks["command.execute.before"]({ sessionID: "session", command: "review", arguments: "changes" }, queuedCommand)
   assert.equal(queuedCommand.parts[0].text, "/queue /review changes")
 
-  await chat(hooks, "clear", "/queue clear")
-  await chat(hooks, "always-off", "/queue always off")
+  await chat(hooks, "clear", "/queue:clear")
+  await chat(hooks, "always-off", "/queue:always-off")
   await busy(first)
   const direct = output("direct", "send immediately")
   await first["chat.message"]({ sessionID: "session", agent: "build", model }, direct)
   assert.equal(direct.parts[0].text, "send immediately")
 })
 
-isolated("accepts q as a queue alias", async () => {
+isolated("registers dedicated commands and retains q for ordinary input", async () => {
   const hooks = await plugin()
   const config = {}
   await hooks.config(config)
-  assert.deepEqual(Object.keys(config.command).sort(), ["q", "queue"])
+  assert.deepEqual(Object.keys(config.command).sort(), [
+    "q", "queue", "queue:always", "queue:always-off", "queue:always-on", "queue:carry", "queue:carry-front",
+    "queue:clear", "queue:flush", "queue:front", "queue:list", "queue:now", "queue:start", "queue:stop",
+  ])
   await busy(hooks)
   await chat(hooks, "last", "/q last")
-  await chat(hooks, "first", "first /q front")
+  await chat(hooks, "first", "/queue:front first")
   assert.equal(await list(hooks), "1. first\n2. last")
+  await chat(hooks, "literal", "/queue front page is unreachable")
+  assert.equal(await list(hooks), "1. first\n2. last\n3. front page is unreachable")
+  await chat(hooks, "trailing", "trailing /q")
+  assert.equal(await list(hooks), "1. first\n2. last\n3. front page is unreachable\n4. trailing")
+})
+
+isolated("old control words are literal input and dedicated controls reject extra input", async () => {
+  const hooks = await plugin()
+  await busy(hooks)
+  await chat(hooks, "old-stop", "/queue stop")
+  await chat(hooks, "old-carry", "/q carry")
+  assert.equal(await list(hooks), "1. stop\n2. carry")
+
+  await chat(hooks, "bad-stop", "/queue:stop later")
+  assert.equal(hooks.toasts.at(-1), "Queue stop does not accept input")
+  await chat(hooks, "bad-clear", "/queue:clear 0")
+  assert.equal(hooks.toasts.at(-1), "Queue clear expects one or more positive item numbers")
+  assert.equal(await list(hooks), "1. stop\n2. carry")
+
+  const oldTrailing = output("old-trailing", "do this /queue front")
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, oldTrailing)
+  assert.equal(oldTrailing.parts[0].text, "do this /queue front")
+
+  const now = output("now", "/queue:now carry")
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, now)
+  assert.equal(now.parts[0].text, "carry")
+  assert.equal(await list(hooks), "1. stop\n2. carry")
+})
+
+isolated("routes dedicated commands through the command hook", async () => {
+  const hooks = await plugin()
+  await busy(hooks)
+  const first = output("first", "")
+  await hooks["command.execute.before"]({ sessionID: "session", command: "queue:front", arguments: "first" }, first)
+  assert.equal(first.parts[0].text, "/queue:front first")
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, first)
+  await chat(hooks, "second", "/queue second")
+  assert.equal(await list(hooks), "1. first\n2. second")
+  await assert.rejects(
+    hooks["command.execute.before"]({ sessionID: "session", command: "queue:clear", arguments: "1" }, { parts: [] }),
+    (response) => response.status === 204,
+  )
+  assert.equal(await list(hooks), "1. second")
+})
+
+isolated("runs trailing slash commands directly when idle and queues them when busy", async () => {
+  const hooks = await plugin()
+  const direct = output("direct", "changes /queue")
+  await hooks["command.execute.before"]({ sessionID: "session", command: "review", arguments: "changes /queue" }, direct)
+  assert.equal(direct.parts[0].text, "changes")
+
+  await busy(hooks)
+  const queued = output("queued", "changes /queue")
+  await hooks["command.execute.before"]({ sessionID: "session", command: "review", arguments: "changes /queue" }, queued)
+  assert.equal(queued.parts[0].text, "/queue /review changes")
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, queued)
+  assert.equal(await list(hooks), "1. /review changes")
+})
+
+isolated("queued commands retain their attachment when the submitted message changes", async () => {
+  const replayed = []
+  const hooks = await plugin({ command: async ({ body }) => replayed.push(body.parts) })
+  await busy(hooks)
+  const attachment = { type: "file", mime: "text/plain", url: "file:///original.txt" }
+  const queued = output("review", "/queue:front /review changes")
+  queued.parts.push(attachment)
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, queued)
+  attachment.url = "file:///changed.txt"
+
+  await chat(hooks, "flush", "/queue:flush")
+  assert.deepEqual(replayed, [[{ ...attachment, url: "file:///original.txt" }]])
 })
 
 isolated("does not requeue internal replays in always mode", async () => {
@@ -148,7 +222,7 @@ isolated("does not requeue internal replays in always mode", async () => {
       return receive(message)
     },
   })
-  await chat(hooks, "always-on", "/queue always on")
+  await chat(hooks, "always-on", "/queue:always-on")
   await busy(hooks)
   await chat(hooks, "prompt", "first")
   await chat(hooks, "command", "/queue /review changes")
@@ -214,7 +288,7 @@ isolated("keeps delayed input queued after a session error", async () => {
 
   assert.equal(await list(current), "1. retry after error")
   assert.equal(replays, 0)
-  await chat(current, "start", "/queue start")
+  await chat(current, "start", "/queue:start")
   assert.equal(await replayed, "retry after error")
 })
 
@@ -243,7 +317,7 @@ isolated("rolls back queue state when persistence fails", async (data) => {
   await writeFile(storage, "not a directory")
   await assert.rejects(chat(current, "failed", "/queue rolled back"))
   await assert.rejects(
-    current["command.execute.before"]({ sessionID: "session", command: "queue", arguments: "list" }, { parts: [] }),
+    current["command.execute.before"]({ sessionID: "session", command: "queue:list", arguments: "" }, { parts: [] }),
     (response) => response.status === 204,
   )
   assert.equal(current.toasts.at(-1), "1. first")
@@ -289,7 +363,7 @@ isolated("orders queue controls after pending input", async () => {
 
   const queued = chat(current, "queued", "/queue pending item")
   await inspectionStarted
-  const cleared = chat(current, "clear", "/queue clear")
+  const cleared = chat(current, "clear", "/queue:clear")
   release({ data: [] })
   await Promise.all([queued, cleared])
 
@@ -307,9 +381,9 @@ isolated("restores in-flight items when completion persistence fails", async (da
     replaying()
     await replay
   } })
-  await chat(current, "stop", "/queue stop")
+  await chat(current, "stop", "/queue:stop")
   await chat(current, "queued", "/queue retry completion")
-  const flushing = chat(current, "flush", "/queue flush")
+  const flushing = chat(current, "flush", "/queue:flush")
   await replayStarted
 
   const storage = join(data, "opencode", "opencode-queue")
@@ -321,7 +395,7 @@ isolated("restores in-flight items when completion persistence fails", async (da
   await mkdir(storage, { recursive: true })
 
   assert.equal(await list(current), "1. retry completion\nQueue is stopped")
-  await chat(current, "flush-again", "/queue flush")
+  await chat(current, "flush-again", "/queue:flush")
   assert.equal(replays, 2)
 })
 
@@ -334,11 +408,11 @@ isolated("keeps an in-flight item durable until replay succeeds", async () => {
     replaying()
     return pending
   } })
-  await chat(first, "stop", "/queue stop")
+  await chat(first, "stop", "/queue:stop")
   await chat(first, "queued", "/queue retry after crash")
-  const flushing = chat(first, "flush", "/queue flush")
+  const flushing = chat(first, "flush", "/queue:flush")
   await replayStarted
-  await chat(first, "concurrent-flush", "/queue flush")
+  await chat(first, "concurrent-flush", "/queue:flush")
   assert.equal(first.toasts.at(-1), "Queue is empty")
 
   const recovered = await plugin()
@@ -359,9 +433,9 @@ isolated("keeps a queued item after an SDK replay error", async () => {
     assert.equal(options.throwOnError, true)
     throw new Error("request failed")
   } })
-  await chat(current, "stop", "/queue stop")
+  await chat(current, "stop", "/queue:stop")
   await chat(current, "queued", "/queue do not lose this")
-  await chat(current, "flush", "/queue flush")
+  await chat(current, "flush", "/queue:flush")
 
   const recovered = await plugin()
   assert.equal(await list(recovered), "1. do not lose this\nQueue is stopped")
@@ -381,7 +455,7 @@ isolated("flush steers all remaining messages while an automatic replay is still
     },
     abort: () => assert.fail("flush must not interrupt the agent"),
   })
-  await chat(current, "always", "/queue always on")
+  await chat(current, "always", "/queue:always-on")
   await busy(current)
   await chat(current, "first", "/queue first")
   await chat(current, "second", "/queue second")
@@ -391,7 +465,7 @@ isolated("flush steers all remaining messages while an automatic replay is still
   await busy(current)
 
   const flushing = assert.rejects(
-    current["command.execute.before"]({ sessionID: "session", command: "queue", arguments: "flush" }, { parts: [] }),
+    current["command.execute.before"]({ sessionID: "session", command: "queue:flush", arguments: "" }, { parts: [] }),
     (response) => response.status === 204,
   )
   await Promise.all(requests.map((request) => request.started.promise))
@@ -423,10 +497,10 @@ for (const [order, busyAgain] of [[[0, 1], false], [[1, 0], false], [[0, 1], tru
     } })
     await busy(current)
     await chat(current, "first", "/queue first")
-    const first = chat(current, "flush-first", "/queue flush")
+    const first = chat(current, "flush-first", "/queue:flush")
     await requests[0].started.promise
     await chat(current, "second", "/queue second")
-    const second = chat(current, "flush-second", "/queue flush")
+    const second = chat(current, "flush-second", "/queue:flush")
     await requests[1].started.promise
     await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
     if (busyAgain) await busy(current)
@@ -467,10 +541,10 @@ isolated("concurrent flushes preserve failed order and stop after later busy eve
   } })
   await busy(current)
   await chat(current, "retry", "/queue retry")
-  const first = chat(current, "flush-first", "/queue flush")
+  const first = chat(current, "flush-first", "/queue:flush")
   await requests[0].started.promise
   await chat(current, "second", "/queue second")
-  const second = chat(current, "flush-second", "/queue flush")
+  const second = chat(current, "flush-second", "/queue:flush")
   await requests[1].started.promise
   await chat(current, "third", "/queue third")
 
@@ -489,19 +563,19 @@ isolated("concurrent flushes preserve failed order and stop after later busy eve
 isolated("lists, restores, and removes individual carry boundaries", async () => {
   const prior = { agent: "build", model, variant: "low" }
   const current = await plugin({ messages: async () => ({ data: [{ info: { role: "user", ...prior } }] }) })
-  await chat(current, "stop", "/queue stop")
+  await chat(current, "stop", "/queue:stop")
   await chat(current, "first", "/queue first")
   await assert.rejects(
-    current["command.execute.before"]({ sessionID: "session", command: "q", arguments: "carry" }, { parts: [] }),
+    current["command.execute.before"]({ sessionID: "session", command: "queue:carry", arguments: "" }, { parts: [] }),
     (response) => response.status === 204,
   )
   await chat(current, "second", "/queue /review changes")
-  const boundary = output("boundary", "carry /q")
+  const boundary = output("boundary", "/queue:carry")
   await current["chat.message"]({ sessionID: "session", agent: "plan", model: { providerID: "other", modelID: "other" }, variant: "high" }, boundary)
   assert.deepEqual(boundary.message, { id: "boundary", ...prior })
   assert.equal(boundary.parts[0].ignored, true)
   await chat(current, "third", "/queue !pwd")
-  await chat(current, "front", "/queue front carry")
+  await chat(current, "front", "/queue:carry-front")
 
   const restored = await plugin()
   assert.equal(await list(restored), [
@@ -513,7 +587,7 @@ isolated("lists, restores, and removes individual carry boundaries", async () =>
     "6. !pwd",
     "Queue is stopped",
   ].join("\n"))
-  await chat(restored, "clear-boundaries", "/queue clear 1 3")
+  await chat(restored, "clear-boundaries", "/queue:clear 1 3")
   assert.equal(await list(restored), "1. first\n2. /review changes\n3. --- carry: new session 1 ---\n4. !pwd\nQueue is stopped")
 })
 
@@ -524,7 +598,7 @@ isolated("carry placeholders retain the latest usable assistant context", async 
     { info: { role: "assistant" } },
   ] }) })
   await busy(current)
-  const message = output("carry", "carry /q")
+  const message = output("carry", "/queue:carry")
   await current["chat.message"]({ sessionID: "session", agent: "build", model }, message)
   assert.deepEqual(message.message, { id: "carry", agent: "plan", model: { providerID: "other", modelID: "reasoner" }, variant: "high" })
   assert.equal(message.parts[0].ignored, true)
@@ -551,16 +625,16 @@ isolated("carries a chain into fresh sessions only after each prompt finishes", 
       await idle(current, path.id)
     },
   })
-  await chat(current, "always", "/queue always on")
+  await chat(current, "always", "/queue:always-on")
   await busy(current)
   await chat(current, "first", "/queue first")
-  await chat(current, "carry-1", "/queue carry")
+  await chat(current, "carry-1", "/queue:carry")
   const attachment = { type: "file", mime: "text/plain", url: "file:///project/notes.txt", filename: "notes.txt" }
   const queued = output("second", "/queue second")
   queued.parts.push(attachment)
   const selected = { agent: "plan", model: { providerID: "other", modelID: "reasoner" }, variant: "high" }
   await current["chat.message"]({ sessionID: "session", ...selected }, queued)
-  await chat(current, "carry-2", "/queue carry")
+  await chat(current, "carry-2", "/queue:carry")
   await chat(current, "third", "/queue third")
   assert.equal(created, 0)
 
@@ -611,13 +685,13 @@ isolated("flush respects carry boundaries while steering a running replay", asyn
   await busy(current)
   await chat(current, "first", "/queue first")
   await chat(current, "steer", "/queue steer")
-  await chat(current, "carry", "/queue carry")
+  await chat(current, "carry", "/queue:carry")
   await chat(current, "next", "/queue next session")
   await idle(current)
   await requests[0].started.promise
-  const flushing = chat(current, "flush", "/queue flush")
+  const flushing = chat(current, "flush", "/queue:flush")
   await requests[1].started.promise
-  await chat(current, "flush-again", "/queue flush")
+  await chat(current, "flush-again", "/queue:flush")
   assert.match(current.toasts.at(-1), /waiting for carry/)
   assert.deepEqual(replayed, [["session", "first"], ["session", "steer"]])
   assert.equal(created, 0)
@@ -643,7 +717,7 @@ isolated("an idle carry creates and selects an empty session without prompting",
     return { response: new Response() }
   })
   await assert.rejects(
-    current["command.execute.before"]({ sessionID: "session", command: "queue", arguments: "carry" }, { parts: [] }),
+    current["command.execute.before"]({ sessionID: "session", command: "queue:carry", arguments: "" }, { parts: [] }),
     (response) => response.status === 204,
   )
   await switched.promise
@@ -667,8 +741,8 @@ isolated("carries consecutive boundaries and replays every input kind in the des
     summarize: async ({ path, body }) => receive("compact", path, body),
   })
   await busy(current)
-  await chat(current, "carry-1", "/queue carry")
-  await chat(current, "carry-2", "/queue carry")
+  await chat(current, "carry-1", "/queue:carry")
+  await chat(current, "carry-2", "/queue:carry")
   await chat(current, "command", "/queue /review changes")
   await chat(current, "shell", "/queue !pwd")
   await chat(current, "compact", "/queue /compact")
@@ -700,10 +774,10 @@ for (const failure of ["status", "create", "commit"]) {
         return { data: { id: "next" } }
       },
     })
-    await chat(current, "stop", "/queue stop")
-    await chat(current, "carry", "/queue carry")
+    await chat(current, "stop", "/queue:stop")
+    await chat(current, "carry", "/queue:carry")
     await chat(current, "next", "/queue keep this")
-    await chat(current, "flush", "/queue flush")
+    await chat(current, "flush", "/queue:flush")
     assert.match(current.toasts.at(-1), /kept for retry/)
     if (failure === "commit") await rm(storage)
     const expected = "1. --- carry: new session 1 ---\n2. keep this\nQueue is stopped"
@@ -713,7 +787,7 @@ for (const failure of ["status", "create", "commit"]) {
     assert.deepEqual(current.selected, [])
 
     failing = false
-    await chat(current, "retry", "/queue flush")
+    await chat(current, "retry", "/queue:flush")
     assert.equal(current.toasts.at(-1), "Carried queue to a new session")
     const restored = await plugin()
     assert.equal(await list(restored), "Queue is empty\nQueue is stopped")
@@ -736,9 +810,9 @@ isolated("carry includes input still being inspected during session creation", a
       return inspected.promise
     },
   })
-  await chat(current, "stop", "/queue stop")
-  await chat(current, "carry", "/queue carry")
-  const flushing = chat(current, "flush", "/queue flush")
+  await chat(current, "stop", "/queue:stop")
+  await chat(current, "carry", "/queue:carry")
+  const flushing = chat(current, "flush", "/queue:flush")
   await started.promise
   const queued = chat(current, "late", "/queue late input")
   await inspecting.promise
@@ -753,8 +827,8 @@ for (const stopped of [false, true]) {
   isolated(`manual carry checks restored session status, stopped: ${stopped}`, async () => {
     const first = await plugin()
     await busy(first)
-    if (stopped) await chat(first, "stop", "/queue stop")
-    await chat(first, "carry", "/queue carry")
+    if (stopped) await chat(first, "stop", "/queue:stop")
+    await chat(first, "carry", "/queue:carry")
     await chat(first, "next", "/queue keep this")
 
     let running = true
@@ -766,12 +840,12 @@ for (const stopped of [false, true]) {
       },
       create: async () => ({ data: { id: `next-${++created}` } }),
     })
-    await chat(restored, "busy-flush", "/queue flush")
+    await chat(restored, "busy-flush", "/queue:flush")
     assert.equal(created, 0)
     assert.equal(await list(restored), `1. --- carry: new session 1 ---\n2. keep this${stopped ? "\nQueue is stopped" : ""}`)
 
     running = false
-    await chat(restored, "idle-flush", "/queue flush")
+    await chat(restored, "idle-flush", "/queue:flush")
     assert.equal(created, 1)
     assert.deepEqual(restored.selected, ["next-1"])
     assert.equal(await list(restored), `Queue is empty${stopped ? "\nQueue is stopped" : ""}`)
@@ -788,9 +862,9 @@ for (const active of [false, true]) {
       status: () => { checking.resolve(); return checked.promise },
       create: async () => ({ data: { id: `next-${++created}` } }),
     })
-    await chat(current, "stop", "/queue stop")
-    await chat(current, "carry", "/queue carry")
-    const flushing = chat(current, "flush", "/queue flush")
+    await chat(current, "stop", "/queue:stop")
+    await chat(current, "carry", "/queue:carry")
+    const flushing = chat(current, "flush", "/queue:flush")
     await checking.promise
     await (active ? busy(current) : idle(current))
     checked.resolve({ data: active ? {} : { session: { type: "busy" } } })
@@ -808,12 +882,12 @@ for (const stage of ["status", "create"]) for (const action of ["clear", "busy",
       create: () => assert.fail("cancelled status checks must not create a session"),
       [stage]: () => { started.resolve(); return finished.promise },
     })
-    await chat(current, "pause", "/queue stop")
-    await chat(current, "carry", "/queue carry")
+    await chat(current, "pause", "/queue:stop")
+    await chat(current, "carry", "/queue:carry")
     await chat(current, "next", "/queue keep this")
-    const flushing = chat(current, "flush", "/queue flush")
+    const flushing = chat(current, "flush", "/queue:flush")
     await started.promise
-    if (action === "clear") await chat(current, "clear", "/queue clear")
+    if (action === "clear") await chat(current, "clear", "/queue:clear")
     if (action === "busy") await busy(current)
     if (action === "error") await current.event({ event: { type: "session.error", properties: { sessionID: "session" } } })
     if (action === "delete") await current.event({ event: { type: "session.deleted", properties: { info: { id: "session" } } } })
@@ -829,22 +903,22 @@ for (const stage of ["status", "create"]) for (const action of ["clear", "busy",
 
 isolated("a TUI selection failure does not undo a committed carry", async () => {
   const current = await plugin({ create: async () => ({ data: { id: "next" } }) }, "project", async () => ({ response: new Response(null, { status: 500 }) }))
-  await chat(current, "stop", "/queue stop")
-  await chat(current, "carry", "/queue carry")
+  await chat(current, "stop", "/queue:stop")
+  await chat(current, "carry", "/queue:carry")
   await chat(current, "next", "/queue keep this")
-  await chat(current, "flush", "/queue flush")
+  await chat(current, "flush", "/queue:flush")
   assert.ok(current.toasts.some((message) => message.includes("the TUI could not switch sessions")))
   assert.equal(await list(current), "Queue is empty\nQueue is stopped")
   assert.equal(await list(current, "next"), "1. keep this\nQueue is stopped")
 })
 
-isolated("rejects carry attachments and now without losing queued work", async () => {
+isolated("rejects carry attachments and arguments without losing queued work", async () => {
   const current = await plugin()
   await busy(current)
   await chat(current, "first", "/queue first")
-  await chat(current, "now", "/q now carry")
-  assert.equal(current.toasts.at(-1), "Queue carry must wait until the session is idle")
-  const message = output("attachment", "/queue carry")
+  await chat(current, "now", "/queue:carry now")
+  assert.equal(current.toasts.at(-1), "Queue carry does not accept arguments")
+  const message = output("attachment", "/queue:carry")
   message.parts.push({ type: "file", mime: "text/plain", url: "file:///notes.txt" })
   await current["chat.message"]({ sessionID: "session", agent: "build", model }, message)
   assert.equal(current.toasts.at(-1), "Queue carry does not support attachments")
