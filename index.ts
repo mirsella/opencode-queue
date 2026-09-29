@@ -435,13 +435,39 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     }
   }
 
+  const knownCommands = async (): Promise<Set<string> | undefined> => {
+    try {
+      const result = await client.command.list({ query: { directory } })
+      if (!result.data) {
+        console.warn("QueuePlugin could not list commands to validate a queued command", result.error)
+        return undefined
+      }
+      return new Set(result.data.map((command) => command.name))
+    } catch (error) {
+      console.warn("QueuePlugin could not list commands to validate a queued command", error)
+      return undefined
+    }
+  }
+
+  const sendPrompt = (sid: string, info: Info, parts: InputPart[]) => {
+    const clone = parts.map((part) => ({ ...part, id: undefined }))
+    markInternal(clone)
+    return client.session.prompt({ path: { id: sid }, body: { ...opts(info), parts: clone } as any, throwOnError: true })
+  }
+
   const replay = async (sid: string, item: ReplayItem) => {
     switch (item.kind) {
       case "shell":
         return shell(sid, item.shell, item.info)
       case "compact":
         return compact(sid, item.info)
-      case "command":
+      case "command": {
+        const known = await knownCommands()
+        // OpenCode answers an unknown command with a generic 500, so retrying it would wedge the queue.
+        if (known && !known.has(item.cmd)) {
+          await toast(`Command /${item.cmd} not found; sending it as a prompt`, "error", 5000)
+          return sendPrompt(sid, item.info, [{ type: "text", text: item.source }, ...item.files])
+        }
         return callCommand(sid, item.cmd, item.args, () =>
           client.session.command({
             path: { id: sid },
@@ -455,11 +481,9 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
             throwOnError: true,
           }),
         )
-      case "prompt": {
-        const parts = item.parts.map((part) => ({ ...part, id: undefined }))
-        markInternal(parts)
-        return client.session.prompt({ path: { id: sid }, body: { ...opts(item.info), parts } as any, throwOnError: true })
       }
+      case "prompt":
+        return sendPrompt(sid, item.info, item.parts)
     }
   }
 

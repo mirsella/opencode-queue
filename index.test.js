@@ -19,7 +19,7 @@ const output = (id, text) => ({
   parts: [{ id: `${id}-part`, type: "text", text }],
 })
 
-const plugin = async (session = {}, project = "project", request = async () => ({ response: new Response() })) => {
+const plugin = async (session = {}, project = "project", request = async () => ({ response: new Response() }), known = ["review"]) => {
   const toasts = []
   const selected = []
   const client = {
@@ -33,6 +33,12 @@ const plugin = async (session = {}, project = "project", request = async () => (
     tui: {
       showToast: async ({ body }) => void toasts.push(body.message),
       executeCommand: async () => undefined,
+    },
+    command: {
+      list: async () => {
+        if (!known) return { data: undefined, error: { message: "command list unavailable" } }
+        return { data: known.map((name) => ({ name, template: "" })) }
+      },
     },
     session: {
       messages: async () => ({ data: [] }),
@@ -225,6 +231,39 @@ isolated("queued commands retain their attachment when the submitted message cha
 
   await chat(hooks, "flush", "/queue:flush")
   assert.deepEqual(replayed, [[{ ...attachment, url: "file:///original.txt" }]])
+})
+
+isolated("sends a queued command as a prompt when the command no longer exists", async () => {
+  const replayed = []
+  const executed = []
+  let hooks
+  hooks = await plugin({
+    prompt: async ({ body }) => {
+      await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, { message: { id: "fallback", agent: "build", model }, parts: body.parts })
+      replayed.push(body.parts[0].text)
+    },
+    command: async ({ body }) => executed.push(body.command),
+  })
+  await chat(hooks, "always-on", "/queue:always-on")
+  await busy(hooks)
+  await chat(hooks, "missing", "/queue /notacommand keep this text")
+  await chat(hooks, "flush", "/queue:flush")
+
+  assert.deepEqual(replayed, ["/notacommand keep this text"])
+  assert.deepEqual(executed, [])
+  assert.ok(hooks.toasts.includes("Command /notacommand not found; sending it as a prompt"))
+  assert.equal(await list(hooks), "Queue is empty")
+})
+
+isolated("replays a queued command normally when the command list is unavailable", async () => {
+  const executed = []
+  const hooks = await plugin({ command: async ({ body }) => executed.push(body.command) }, "project", undefined, null)
+  await busy(hooks)
+  await chat(hooks, "review", "/queue /review changes")
+  await chat(hooks, "flush", "/queue:flush")
+
+  assert.deepEqual(executed, ["review"])
+  assert.equal(await list(hooks), "Queue is empty")
 })
 
 isolated("does not requeue internal replays in always mode", async () => {

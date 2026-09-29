@@ -87,6 +87,7 @@ When the session is busy:
 - `/queue:now ...` sends prompts and slash commands immediately regardless of queue state or mode. Shell commands remain queued until the session is idle.
 - Only one queued entry is sent per idle transition, so queued work runs one item at a time.
 - Queued entries are kept in place after an error, abort, crash, or restart.
+- A queued slash command that no longer exists when its turn comes is sent as a plain prompt instead of failing the queue.
 - `/queue:stop` pauses automatic replay without clearing queued entries, and `/queue:start` resumes it.
 - `/queue:always-on` also queues plain prompts and custom slash commands while the session is busy, paused, or already has queued work. OpenCode does not expose native shell or `/compact` submissions to these plugin hooks.
 - `/queue:flush` submits waiting entries up to the next carry boundary immediately, even while a previous replay is still running. Prompts appear in the conversation as normal steering messages with OpenCode's queued indicator; the current run is not aborted and already-submitted entries are not resent.
