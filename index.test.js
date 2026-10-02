@@ -243,7 +243,7 @@ isolated("registers dedicated commands and retains q for ordinary input", async 
   const config = {}
   await hooks.config(config)
   assert.deepEqual(Object.keys(config.command).sort(), [
-    "q", "queue", "queue:always", "queue:always-off", "queue:always-on", "queue:carry", "queue:carry-front",
+    "q", "queue", "queue:always", "queue:always-off", "queue:always-on", "queue:apply_model", "queue:carry", "queue:carry-front",
     "queue:clear", "queue:flush", "queue:front", "queue:list", "queue:now", "queue:start", "queue:stop",
   ])
   await busy(hooks)
@@ -317,6 +317,165 @@ isolated("routes dedicated commands through the command hook", async () => {
     (response) => response.status === 204,
   )
   assert.equal(await list(hooks), "1. second")
+})
+
+isolated("applies the selected model across carry boundaries and restores it for every replay kind", async () => {
+  const hooks = await plugin()
+  await control(hooks, "queue:stop")
+  const attachment = { type: "file", mime: "text/plain", url: "file:///notes.txt" }
+  const queued = output("prompt", "/queue first")
+  queued.parts.push(attachment)
+  await hooks["chat.message"]({ sessionID: "session", agent: "plan", model, variant: "old" }, queued)
+  await control(hooks, "queue:carry")
+  await chat(hooks, "command", "/queue /review changes")
+  await chat(hooks, "shell", "/queue !pwd")
+  await chat(hooks, "compact", "/queue /compact")
+  await control(hooks, "queue:stop", "other")
+  await chat(hooks, "other", "/queue other session", "other")
+
+  const selected = { providerID: "other", modelID: "reasoner" }
+  const message = output("apply", "")
+  await hooks["command.execute.before"]({ sessionID: "session", command: "queue:apply_model", arguments: "" }, message)
+  assert.equal(message.parts[0].text, "/queue:apply_model")
+  await assert.rejects(
+    hooks["chat.message"]({ sessionID: "session", agent: "build", model: selected, variant: "high" }, message),
+    (response) => response.status === 204,
+  )
+  assert.equal(hooks.toasts.at(-1), "Applied other/reasoner (high) to 4 queued items")
+
+  const replayed = {}
+  const restored = await plugin({
+    prompt: async ({ path, body }) => { replayed[path.id] = body },
+    command: async ({ body }) => { replayed.command = body },
+    shell: async ({ body }) => { replayed.shell = body },
+    summarize: async ({ body }) => { replayed.compact = body },
+    create: async () => ({ data: { id: "next" } }),
+  })
+  await control(restored, "queue:flush")
+  assert.deepEqual(replayed.session.model, selected)
+  assert.equal(replayed.session.variant, "high")
+  assert.equal(replayed.session.agent, "plan")
+  assert.deepEqual(replayed.session.parts[1], { ...attachment, id: undefined })
+  await control(restored, "queue:flush")
+  await control(restored, "queue:flush", "next")
+  assert.equal(replayed.command.model, "other/reasoner")
+  assert.equal(replayed.command.variant, "high")
+  assert.deepEqual(replayed.shell.model, selected)
+  assert.deepEqual(replayed.compact, selected)
+  await control(restored, "queue:flush", "other")
+  assert.deepEqual(replayed.other.model, model)
+})
+
+isolated("apply_model clears the previous variant and excludes in-flight entries", async () => {
+  const started = deferred()
+  const finished = deferred()
+  const replayed = []
+  const hooks = await plugin({ prompt: async ({ body }) => {
+    replayed.push(body)
+    if (replayed.length === 1) {
+      started.resolve()
+      await finished.promise
+    }
+  } })
+  await control(hooks, "queue:stop")
+  await chat(hooks, "first", "/queue running")
+  const flushing = control(hooks, "queue:flush")
+  await started.promise
+  await hooks["chat.message"]({ sessionID: "session", agent: "plan", model, variant: "old" }, output("second", "/queue waiting"))
+  const selected = { providerID: "other", modelID: "plain" }
+  await assert.rejects(
+    hooks["chat.message"]({ sessionID: "session", agent: "build", model: selected }, output("apply", "/queue:apply_model")),
+    (response) => response.status === 204,
+  )
+  assert.equal(hooks.toasts.at(-1), "Applied other/plain to 1 queued item")
+  finished.resolve()
+  await flushing
+  await control(hooks, "queue:flush")
+  assert.deepEqual(replayed[0].model, model)
+  assert.deepEqual(replayed[1].model, selected)
+  assert.equal(replayed[1].variant, undefined)
+  assert.equal(replayed[1].agent, "plan")
+  await assert.rejects(chat(hooks, "empty", "/queue:apply_model"), (response) => response.status === 204)
+  assert.equal(hooks.toasts.at(-1), "Queue is empty")
+})
+
+isolated("apply_model waits for pending input and cancels without recording a placeholder", async (data) => {
+  const inspecting = deferred()
+  const inspected = deferred()
+  const prior = { agent: "build", model, variant: "low" }
+  let inspections = 0
+  const replayed = []
+  const hooks = await plugin({
+    messages: async () => {
+      inspections++
+      inspecting.resolve()
+      await inspected.promise
+      return { data: [{ info: { role: "user", ...prior } }] }
+    },
+    prompt: async ({ body }) => replayed.push(body),
+  })
+  await control(hooks, "queue:stop")
+  const queuing = chat(hooks, "queued", "/queue waiting")
+  await inspecting.promise
+
+  const selected = { providerID: "other", modelID: "reasoner" }
+  const message = output("apply", "/queue:apply_model")
+  Object.assign(message.message, { agent: "plan", model: selected, variant: "high" })
+  const update = assert.rejects(
+    hooks["chat.message"]({ sessionID: "session", variant: "high" }, message),
+    (response) => response.status === 204,
+  )
+  const flushing = control(hooks, "queue:flush")
+  inspected.resolve()
+  await Promise.all([queuing, update, flushing])
+
+  assert.equal(inspections, 1)
+  assert.equal(replayed.length, 1)
+  assert.deepEqual(replayed[0].model, selected)
+  assert.equal(replayed[0].variant, "high")
+  assert.equal(replayed[0].agent, "build")
+  const stored = JSON.parse(await readFile(join(data, "opencode", "opencode-queue", `${createHash("sha256").update("project").digest("hex")}.json`), "utf8"))
+  assert.deepEqual(stored.sessions.session.hidden, ["queued"])
+  assert.equal(stored.sessions.session.stopped, true)
+})
+
+isolated("apply_model leaves live entries and its placeholder intact when persistence fails", async (data) => {
+  const replayed = []
+  const hooks = await plugin({ prompt: async ({ body }) => replayed.push(body) })
+  await control(hooks, "queue:stop")
+  await hooks["chat.message"]({ sessionID: "session", agent: "plan", model, variant: "old" }, output("queued", "/queue waiting"))
+
+  const storage = join(data, "opencode", "opencode-queue")
+  await rm(storage, { recursive: true })
+  await writeFile(storage, "not a directory")
+  const message = output("failed", "/queue:apply_model")
+  const selected = { providerID: "other", modelID: "reasoner" }
+  await assert.rejects(hooks["chat.message"]({ sessionID: "session", model: selected, variant: "high" }, message))
+  assert.equal(message.parts[0].text, "/queue:apply_model")
+  assert.equal(message.parts[0].ignored, undefined)
+  await rm(storage)
+  await mkdir(storage)
+
+  await control(hooks, "queue:flush")
+  assert.deepEqual(replayed[0].model, model)
+  assert.equal(replayed[0].variant, "old")
+  assert.equal(replayed[0].agent, "plan")
+})
+
+isolated("apply_model rejects arguments and attachments", async () => {
+  const hooks = await plugin()
+  await assert.rejects(
+    hooks["command.execute.before"]({ sessionID: "session", command: "queue:apply_model", arguments: "other/model" }, { parts: [] }),
+    (response) => response.status === 204,
+  )
+  assert.equal(hooks.toasts.at(-1), "Queue apply_model does not accept input")
+  const message = output("attachment", "/queue:apply_model")
+  message.parts.push({ type: "file", mime: "text/plain", url: "file:///notes.txt" })
+  await assert.rejects(
+    hooks["chat.message"]({ sessionID: "session", agent: "build", model }, message),
+    (response) => response.status === 204,
+  )
+  assert.equal(hooks.toasts.at(-1), "Queue apply_model does not accept input")
 })
 
 isolated("runs trailing slash commands directly when idle and queues them when busy", async () => {

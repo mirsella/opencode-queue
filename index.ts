@@ -27,6 +27,7 @@ const COMMANDS = {
   "queue:carry": "Continue the queue in a new session",
   "queue:carry-front": "Put a new-session boundary at the front of the queue",
   "queue:list": "Show queued input",
+  "queue:apply_model": "Apply the selected model and thinking variant to all queued input",
   "queue:clear": "Clear the queue or selected item numbers",
   "queue:flush": "Send waiting entries immediately",
   "queue:start": "Resume automatic queue replay",
@@ -70,6 +71,7 @@ type Placeholder = { id: string; part: TextPart }
 
 type Op =
   | ControlOp
+  | { kind: "apply_model" }
   | { kind: "invalid"; message: string }
   | EntryOp
 
@@ -92,6 +94,7 @@ const parse = (input: QueueInput, files: number): Op => {
       return { kind: "clear", indices }
     }
     case "queue:list":
+    case "queue:apply_model":
     case "queue:flush":
     case "queue:start":
     case "queue:stop":
@@ -101,6 +104,7 @@ const parse = (input: QueueInput, files: number): Op => {
       if (text || files) return { kind: "invalid", message: `Queue ${input.command.slice(6)} does not accept input` }
       switch (input.command) {
         case "queue:list": return { kind: "list" }
+        case "queue:apply_model": return { kind: "apply_model" }
         case "queue:flush": return { kind: "flush" }
         case "queue:start": return { kind: "start" }
         case "queue:stop": return { kind: "stop" }
@@ -179,8 +183,8 @@ const describeQueue = (state?: Draft) => {
   const list = state?.items.map((item, i) => `${i + 1}. ${item.kind === "carry" ? `--- carry: new session ${++boundary} ---` : itemText(item)}`).join("\n") || "Queue is empty"
   return state?.stopped ? `${list}\nQueue is stopped` : list
 }
-// OpenCode's command hook has no cancel/noReply output. Throwing a raw Effect
-// response is handled by OpenCode's HTTP layer as an empty successful command.
+// Neither input hook exposes cancel/noReply. A raw Effect response stops the
+// request before OpenCode saves the message or enters the agent loop.
 const handled = (): never => {
   throw HttpServerResponse.empty({ status: 204 })
 }
@@ -281,7 +285,7 @@ const alwaysSetting = (path: string) => {
 export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const sessions = new Map<string, State>()
   const deleted = new Set<string>()
-  const enqueueTurns = new Map<string, Promise<unknown>>()
+  const inputTurns = new Map<string, Promise<unknown>>()
   const internalCommands: { sid: string; command: string; args: string; used: boolean }[] = []
   const origin = randomUUID()
   const post = (client as unknown as { _client?: { post?: Post } })._client?.post
@@ -355,15 +359,15 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       return value
     })
 
-  const orderedEnqueue = <T>(sid: string, action: () => Promise<T>) => {
-    const turn = (enqueueTurns.get(sid) ?? Promise.resolve()).catch(() => undefined).then(action)
-    enqueueTurns.set(sid, turn)
+  const orderedInput = <T>(sid: string, action: () => Promise<T>) => {
+    const turn = (inputTurns.get(sid) ?? Promise.resolve()).catch(() => undefined).then(action)
+    inputTurns.set(sid, turn)
     return turn.finally(() => {
-      if (enqueueTurns.get(sid) === turn) enqueueTurns.delete(sid)
+      if (inputTurns.get(sid) === turn) inputTurns.delete(sid)
     })
   }
 
-  const afterEnqueue = <T>(sid: string, action: () => Promise<T>) => (enqueueTurns.get(sid) ?? Promise.resolve()).catch(() => undefined).then(action)
+  const afterInput = <T>(sid: string, action: () => Promise<T>) => (inputTurns.get(sid) ?? Promise.resolve()).catch(() => undefined).then(action)
 
   const toast = (message: string, variant: "info" | "error", duration = 2500) =>
     client.tui.showToast({ body: { message, variant, duration }, query: { directory } }).catch(() => undefined)
@@ -510,7 +514,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     if (deleted.has(sid)) return
     const current = state(sid)
     if (!canAdvance(current)) return
-    void afterEnqueue(sid, () => flush(sid, "next")).catch(async (error) => {
+    void afterInput(sid, () => flush(sid, "next")).catch(async (error) => {
       console.error("QueuePlugin could not advance the persisted queue", error)
       await toast(`Queue persistence failed: ${error instanceof Error ? error.message : String(error)}`, "error", 5000)
     })
@@ -547,7 +551,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       if (!eligible()) return "Carry deferred because the queue or session changed"
       const created = await client.session.create({ query: { directory }, throwOnError: true })
       const nextID = created.data.id
-      destination = await afterEnqueue(sid, () => serialize(async () => {
+      destination = await afterInput(sid, () => serialize(async () => {
         if (deleted.has(nextID) || !eligible() || current.activity.kind !== "idle") return undefined
         if (current.flight !== carrying) throw new Error(`QueuePlugin lost track of carry for session ${sid}`)
 
@@ -782,14 +786,15 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       const parts = files(output.parts)
       const op = parse(request, parts.length)
 
-      if (control(op)) return stop(await afterEnqueue(sid, () => manage(sid, op)))
+      if (control(op)) return stop(await afterInput(sid, () => manage(sid, op)))
       if (op.kind === "invalid") return stop(op.message, "error")
       if (op.kind === "carry") {
-        await orderedEnqueue(sid, () => enqueue(sid, { kind: "carry" }, isFront(request.command)))
+        await orderedInput(sid, () => enqueue(sid, { kind: "carry" }, isFront(request.command)))
         return handled()
       }
 
-      if (sendNow(sessions.get(sid), request.command, op)) {
+      // The command hook lacks the selected model; chat.message applies it and cancels the prompt.
+      if (op.kind !== "apply_model" && sendNow(sessions.get(sid), request.command, op)) {
         if (op.kind === "shell") {
           await shell(sid, op.shell, await run(sid))
           return handled()
@@ -810,7 +815,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         return
       }
 
-      output.parts.splice(0, output.parts.length, { type: "text", text: `/${request.command} ${body}` } as any, ...parts)
+      output.parts.splice(0, output.parts.length, { type: "text", text: `/${request.command}${body ? ` ${body}` : ""}` } as any, ...parts)
     },
     "chat.message": async (input, output) => {
       const sid = input.sessionID
@@ -835,12 +840,28 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       const info = { agent: input.agent ?? output.message.agent, model: input.model ?? output.message.model, variant: input.variant }
       const placeholder = { id: output.message.id, part: text }
 
+      if (op.kind === "apply_model") {
+        const model = { ...info.model }
+        return stop(await orderedInput(sid, () => persist(sid, undefined, (draft) => {
+          let count = 0
+          for (const [i, item] of draft.items.entries()) {
+            if (item.kind === "carry") continue
+            draft.items[i] = { ...item, info: { ...item.info, model, variant: info.variant } }
+            count++
+          }
+          if (!count) return "Queue is empty"
+          const label = `${model.providerID}/${model.modelID}${info.variant ? ` (${info.variant})` : ""}`
+          return `Applied ${label} to ${count} queued item${count === 1 ? "" : "s"}`
+        })))
+      }
+
       if (control(op)) {
-        await toast(await afterEnqueue(sid, () => manage(sid, op, placeholder)), "info", 5000)
+        await toast(await afterInput(sid, () => manage(sid, op, placeholder)), "info", 5000)
         return
       }
 
       if (op.kind === "invalid") {
+        if (request.command === "queue:apply_model") return stop(op.message, "error")
         await persist(sid, placeholder, () => undefined)
         await toast(op.message, "error", 5000)
         return
@@ -862,7 +883,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         return
       }
 
-      return orderedEnqueue(sid, async () => {
+      return orderedInput(sid, async () => {
         if (deleted.has(sid)) {
           console.warn("QueuePlugin stopped queueing input for a deleted session", sid)
           return
@@ -874,6 +895,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         }
         if (prior) Object.assign(output.message, opts(prior))
         else console.warn("QueuePlugin could not neutralize queued placeholder metadata because the session has no previous message context")
+
         let item: Item
         if (op.kind === "carry") item = { kind: "carry" }
         else if (op.kind === "shell") item = { kind: "shell", info, source: op.source, shell: op.shell }

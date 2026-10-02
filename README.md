@@ -35,6 +35,7 @@ continue after this task /queue
 /queue:carry
 /queue start the next task in a fresh session
 /queue:list
+/queue:apply_model
 /queue:stop
 /queue:start
 /queue:flush
@@ -63,6 +64,7 @@ continue after this task /queue
 | `/queue:carry` | Queue a boundary that moves the remaining queue to a fresh session. |
 | `/queue:carry-front` | Put a fresh-session boundary before existing queued entries. |
 | `/queue:list` | Show the current queue. |
+| `/queue:apply_model` | Apply the currently selected model and thinking variant to all waiting entries in the current queue. |
 | `/queue:stop` | Pause automatic sending of queued entries. |
 | `/queue:start` | Resume automatic sending of queued entries. |
 | `/queue:always` | Show whether automatic queueing is enabled and its scope. |
@@ -95,6 +97,12 @@ When the session is busy:
 When the session is idle, `/queue` input runs immediately. Bare `/queue` and queue controls work whether the session is idle or busy.
 
 Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+
+## Change queued models
+
+Select a model and thinking variant, then run `/queue:apply_model` with no arguments or attachments. It updates every waiting entry in the current session's queue, including entries after carry boundaries, and saves the changes across restarts. Selecting no variant clears each entry's previous variant.
+
+Each entry keeps its agent, content, and attachments. Already-submitted entries keep their original settings. The command preserves the queue's running or stopped state.
 
 ## Automatic queueing
 
