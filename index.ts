@@ -31,9 +31,9 @@ const COMMANDS = {
   "queue:flush": "Send waiting entries immediately",
   "queue:start": "Resume automatic queue replay",
   "queue:stop": "Pause automatic queue replay",
-  "queue:always": "Show the global automatic queue setting",
-  "queue:always-on": "Enable automatic queueing globally",
-  "queue:always-off": "Disable automatic queueing globally",
+  "queue:always": "Show the automatic queue setting and its scope",
+  "queue:always-on": "Enable automatic queueing",
+  "queue:always-off": "Disable automatic queueing",
 } as const
 type QueueCommand = keyof typeof COMMANDS
 type QueueInput = { body: string; command: QueueCommand }
@@ -249,6 +249,35 @@ const writeJson = async (path: string, value: unknown) => {
   }
 }
 
+const alwaysSetting = (path: string) => {
+  const value = process.env.OPENCODE_QUEUE_ALWAYS?.trim().toLowerCase()
+  if (value) {
+    let enabled = ["1", "true", "on"].includes(value)
+    if (!enabled && !["0", "false", "off"].includes(value)) {
+      throw new Error("QueuePlugin OPENCODE_QUEUE_ALWAYS must be 1, true, on, 0, false, off, or empty")
+    }
+    return {
+      scope: "for this instance (OPENCODE_QUEUE_ALWAYS)",
+      get: () => enabled,
+      set: (value: boolean) => { enabled = value },
+    }
+  }
+  return {
+    scope: "globally",
+    get: async () => {
+      try {
+        const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
+        if (record(parsed) && typeof parsed.always === "boolean") return parsed.always
+        console.warn("QueuePlugin ignored invalid global settings", path)
+      } catch (error) {
+        if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load global settings", error)
+      }
+      return false
+    },
+    set: (enabled: boolean) => writeJson(path, { always: enabled }),
+  }
+}
+
 export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const sessions = new Map<string, State>()
   const deleted = new Set<string>()
@@ -258,19 +287,9 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const post = (client as unknown as { _client?: { post?: Post } })._client?.post
   const root = join(dataHome(), "opencode", "opencode-queue")
   const path = join(root, `${createHash("sha256").update(project.id).digest("hex")}.json`)
-  const settingsPath = join(root, "settings.json")
+  const always = alwaysSetting(join(root, "settings.json"))
   let writes = Promise.resolve()
 
-  const readAlways = async () => {
-    try {
-      const parsed: unknown = JSON.parse(await readFile(settingsPath, "utf8"))
-      if (record(parsed) && typeof parsed.always === "boolean") return parsed.always
-      console.warn("QueuePlugin ignored invalid global settings", settingsPath)
-    } catch (error) {
-      if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load global settings", error)
-    }
-    return false
-  }
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
     if (!record(parsed) || parsed.version !== 1 || parsed.projectID !== project.id || !record(parsed.sessions)) {
@@ -322,7 +341,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     return current
   }
 
-  const automaticallyQueue = async (sid: string) => shouldQueue(sessions.get(sid)) && (await readAlways())
+  const automaticallyQueue = async (sid: string) => shouldQueue(sessions.get(sid)) && (await always.get())
 
   const persist = <T>(sid: string, placeholder: Placeholder | undefined, mutate: (draft: Draft) => T) =>
     serialize(async () => {
@@ -650,12 +669,12 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
     if (op.kind === "always") {
       const enabled = await serialize(async () => {
-        if (op.enabled === undefined) return readAlways()
-        await writeJson(settingsPath, { always: op.enabled })
+        if (op.enabled === undefined) return always.get()
+        await always.set(op.enabled)
         return op.enabled
       })
       if (placeholder) await persist(sid, placeholder, () => undefined)
-      return `Always queue is ${enabled ? "on" : "off"} globally`
+      return `Always queue is ${enabled ? "on" : "off"} ${always.scope}`
     }
 
     const message = await persist(sid, placeholder, (draft) => {

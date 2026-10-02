@@ -65,9 +65,9 @@ continue after this task /queue
 | `/queue:list` | Show the current queue. |
 | `/queue:stop` | Pause automatic sending of queued entries. |
 | `/queue:start` | Resume automatic sending of queued entries. |
-| `/queue:always` | Show whether automatic queueing is enabled globally. |
-| `/queue:always-on` | Enable automatic queueing in every project. |
-| `/queue:always-off` | Disable automatic queueing in every project. |
+| `/queue:always` | Show whether automatic queueing is enabled and its scope. |
+| `/queue:always-on` | Enable automatic queueing globally, or locally when `OPENCODE_QUEUE_ALWAYS` is set. |
+| `/queue:always-off` | Disable automatic queueing globally, or locally when `OPENCODE_QUEUE_ALWAYS` is set. |
 | `/queue:flush` | Send waiting entries immediately, up to the next carry boundary. |
 | `/queue:clear` | Clear the current queue, including carry boundaries. |
 | `/queue:clear 1` | Clear item 1 from the current queue, whether it is input or a carry boundary. |
@@ -94,7 +94,24 @@ When the session is busy:
 
 When the session is idle, `/queue` input runs immediately. Bare `/queue` and queue controls work whether the session is idle or busy.
 
-Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. The `always` setting applies to every OpenCode project. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+
+## Automatic queueing
+
+By default, `/queue:always-on` and `/queue:always-off` save a global setting shared by every OpenCode project. Changes apply to running instances without restarting them. Automatic queueing is off until enabled.
+
+To preconfigure an OpenCode instance, set `OPENCODE_QUEUE_ALWAYS` when starting it:
+
+```sh
+OPENCODE_QUEUE_ALWAYS=1 opencode
+OPENCODE_QUEUE_ALWAYS=0 opencode
+```
+
+`1`, `true`, and `on` enable automatic queueing. `0`, `false`, and `off` disable it. Values are case-insensitive and surrounding whitespace is ignored. An unset or empty value uses the global setting. Other values cause plugin initialization to fail with an error.
+
+The plugin reads the variable at initialization. It overrides the global setting without writing to `settings.json`. With this override active, `/queue:always-on` and `/queue:always-off` change only the in-memory value for the current project's plugin instance. Sessions within that instance share the value; other instances keep their own settings. Reloading the plugin or restarting OpenCode resets the override to the environment value.
+
+`/queue:always` reports the effective value and whether it applies globally or to this instance. `/queue:now` still bypasses automatic queueing for prompts and slash commands.
 
 ## Carry between sessions
 

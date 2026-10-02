@@ -63,17 +63,28 @@ const list = async (hooks, sessionID = "session") => {
   await chat(hooks, `list-${sessionID}`, "/queue:list", sessionID)
   return hooks.toasts.at(-1)
 }
+const control = async (hooks, command, sessionID = "session") => {
+  await assert.rejects(
+    hooks["command.execute.before"]({ sessionID, command, arguments: "" }, { parts: [] }),
+    (response) => response.status === 204,
+  )
+  return hooks.toasts.at(-1)
+}
 
 const isolated = (name, run) =>
   test(name, { concurrency: false }, async () => {
     const previous = process.env.XDG_DATA_HOME
+    const previousAlways = process.env.OPENCODE_QUEUE_ALWAYS
     const data = await mkdtemp(join(tmpdir(), "opencode-queue-"))
     process.env.XDG_DATA_HOME = data
+    delete process.env.OPENCODE_QUEUE_ALWAYS
     try {
       await run(data)
     } finally {
       if (previous === undefined) delete process.env.XDG_DATA_HOME
       else process.env.XDG_DATA_HOME = previous
+      if (previousAlways === undefined) delete process.env.OPENCODE_QUEUE_ALWAYS
+      else process.env.OPENCODE_QUEUE_ALWAYS = previousAlways
       await rm(data, { recursive: true, force: true })
     }
   })
@@ -122,6 +133,109 @@ isolated("persists global always mode and bypasses it with now", async () => {
   const direct = output("direct", "send immediately")
   await first["chat.message"]({ sessionID: "session", agent: "build", model }, direct)
   assert.equal(direct.parts[0].text, "send immediately")
+})
+
+isolated("environment always mode works without creating global settings", async (data) => {
+  const other = await plugin({}, "other-project")
+  process.env.OPENCODE_QUEUE_ALWAYS = "1"
+  const local = await plugin()
+  delete process.env.OPENCODE_QUEUE_ALWAYS
+
+  const direct = output("idle", "send while idle")
+  await local["chat.message"]({ sessionID: "session", agent: "build", model }, direct)
+  assert.equal(direct.parts[0].text, "send while idle")
+  await busy(local)
+  await busy(other)
+  await chat(local, "queued", "queue locally")
+  await chat(other, "direct", "send normally")
+  assert.equal(await list(local), "1. queue locally")
+  assert.equal(await list(other), "Queue is empty")
+
+  const immediate = output("now", "")
+  await local["command.execute.before"]({ sessionID: "session", command: "queue:now", arguments: "send immediately" }, immediate)
+  await local["chat.message"]({ sessionID: "session", agent: "build", model }, immediate)
+  assert.equal(immediate.parts[0].text, "send immediately")
+  assert.equal(await list(local), "1. queue locally")
+
+  await control(local, "queue:always-off")
+  await control(local, "queue:always-on")
+  await assert.rejects(readFile(join(data, "opencode", "opencode-queue", "settings.json")), { code: "ENOENT" })
+})
+
+for (const [value, enabled] of [["1", true], ["0", false]]) {
+  isolated(`environment always mode ${enabled} stays local through runtime toggles`, async (data) => {
+    const global = await plugin({}, "global-project")
+    const initialCommand = enabled ? "queue:always-on" : "queue:always-off"
+    const toggledCommand = enabled ? "queue:always-off" : "queue:always-on"
+    await control(global, toggledCommand)
+    const settingsPath = join(data, "opencode", "opencode-queue", "settings.json")
+    const stored = await readFile(settingsPath, "utf8")
+
+    process.env.OPENCODE_QUEUE_ALWAYS = value
+    const local = await plugin()
+    const peer = await plugin()
+    delete process.env.OPENCODE_QUEUE_ALWAYS
+    const ordinary = await plugin({}, "ordinary-project")
+    const status = `Always queue is ${enabled ? "on" : "off"} for this instance (OPENCODE_QUEUE_ALWAYS)`
+    assert.equal(await control(local, "queue:always"), status)
+    await busy(local)
+    await chat(local, "initial", "initial input")
+    assert.equal(await list(local), enabled ? "1. initial input" : "Queue is empty")
+
+    const command = output("command", "changes")
+    await local["command.execute.before"]({ sessionID: "session", command: "review", arguments: "changes" }, command)
+    assert.equal(command.parts[0].text, enabled ? "/queue /review changes" : "changes")
+
+    assert.equal(await control(local, toggledCommand), `Always queue is ${enabled ? "off" : "on"} for this instance (OPENCODE_QUEUE_ALWAYS)`)
+    assert.equal(await control(peer, "queue:always"), status)
+    assert.equal(await readFile(settingsPath, "utf8"), stored)
+    await chat(local, "toggled", "input after toggle")
+    assert.equal(await list(local), enabled ? "1. initial input" : "1. input after toggle")
+    await chat(local, "restore", `/${initialCommand}`)
+    assert.equal(local.toasts.at(-1), status)
+    assert.equal(await readFile(settingsPath, "utf8"), stored)
+    assert.equal(await control(local, "queue:always", "another-session"), status)
+
+    for (const setting of [enabled, !enabled]) {
+      await control(global, setting ? "queue:always-on" : "queue:always-off")
+      assert.equal(await control(ordinary, "queue:always"), `Always queue is ${setting ? "on" : "off"} globally`)
+      assert.equal(await control(local, "queue:always"), status)
+    }
+
+    await control(local, toggledCommand)
+    process.env.OPENCODE_QUEUE_ALWAYS = value
+    const restarted = await plugin()
+    assert.equal(await control(restarted, "queue:always"), status)
+  })
+}
+
+isolated("environment always mode accepts boolean words regardless of case or whitespace", async () => {
+  for (const [value, enabled] of [["true", true], [" ON ", true], ["false", false], [" OFF ", false]]) {
+    process.env.OPENCODE_QUEUE_ALWAYS = value
+    assert.equal(await control(await plugin(), "queue:always"), `Always queue is ${enabled ? "on" : "off"} for this instance (OPENCODE_QUEUE_ALWAYS)`)
+  }
+})
+
+isolated("empty environment values keep global runtime settings", async () => {
+  for (const value of ["", "   "]) {
+    process.env.OPENCODE_QUEUE_ALWAYS = value
+    const hooks = await plugin()
+    assert.equal(await control(hooks, "queue:always-on"), "Always queue is on globally")
+    assert.equal(await control(await plugin(), "queue:always"), "Always queue is on globally")
+    await control(hooks, "queue:always-off")
+  }
+})
+
+isolated("invalid environment values fail initialization without changing global settings", async (data) => {
+  const hooks = await plugin()
+  await control(hooks, "queue:always-on")
+  const settingsPath = join(data, "opencode", "opencode-queue", "settings.json")
+  const stored = await readFile(settingsPath, "utf8")
+  for (const value of ["tru", "2"]) {
+    process.env.OPENCODE_QUEUE_ALWAYS = value
+    await assert.rejects(plugin(), /OPENCODE_QUEUE_ALWAYS must be/)
+  }
+  assert.equal(await readFile(settingsPath, "utf8"), stored)
 })
 
 isolated("registers dedicated commands and retains q for ordinary input", async () => {
