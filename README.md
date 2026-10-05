@@ -161,6 +161,27 @@ The previous session's queue becomes empty after the transfer. Boundaries surviv
 
 Carry does not accept arguments or attachments. `/queue:now carry` sends the word `carry` as a prompt.
 
+## Remaining blockers for OpenCode v2
+
+Migrating while keeping the plugin's own queue and current features requires these APIs:
+
+- Expose existing session APIs to server plugins ([#47229](https://github.com/anomalyco/opencode/issues/47229)):
+  - `context.session.shell()` to replay queued shell commands.
+  - `context.session.active()` to check activity without waiting for idle.
+
+- Add a submission hook that lets plugins capture and consume input:
+  - Cover prompts, slash commands, shell input, and `/compact`.
+  - Run before agent/model changes, command callbacks, or message admission.
+  - Include the full text, attachments, input mode, raw command, and selected agent/model/variant.
+  - Let the plugin handle input successfully without adding a transcript message or starting execution.
+  - The prompt hook from [#45550](https://github.com/anomalyco/opencode/pull/45550) supports rewriting, but does not provide this full interception.
+  - The composer APIs in [#51209](https://github.com/anomalyco/opencode/issues/51209) and [#51490](https://github.com/anomalyco/opencode/pull/51490) cover reading, appending, and focusing input, rather than consuming submissions.
+
+- Bind saved settings to each released input ([#48356](https://github.com/anomalyco/opencode/issues/48356)):
+  - Accept saved agent/model/variant settings on prompts and commands, and the saved model on compaction.
+  - Apply settings when the input is delivered, without changing work already running.
+  - Preserve this behavior for `/queue:now` and `/queue:flush`, which can submit input while the session is busy.
+
 ## Notes
 
 - It does not add a keyboard shortcut. OpenCode plugins cannot currently register custom TUI keybindings.
