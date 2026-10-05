@@ -777,7 +777,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
     return message
   }
 
-  const hooks: Awaited<ReturnType<Plugin>> = {
+  const hooks: Awaited<ReturnType<Plugin>> & { dispose: () => Promise<void> } = {
     dispose,
     config: async (cfg) => {
       cfg.command ??= {}
