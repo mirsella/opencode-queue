@@ -96,7 +96,9 @@ When the session is busy:
 
 When the session is idle, `/queue` input runs immediately. Bare `/queue` and queue controls work whether the session is idle or busy.
 
-Queues are scoped to the current project and session. They are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+Queues are scoped to the current project and session. Using OpenCode's `/move` to change a session's directory keeps its queue, selected models, attachments, and running or stopped state. Queued work replays in the session's current directory.
+
+Queues are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
 
 ## Change queued models
 
@@ -123,7 +125,9 @@ The plugin reads the variable at initialization. It overrides the global setting
 
 ## Carry between sessions
 
-`/queue:carry` adds a fresh-session boundary to the queue. When it reaches the front and the current session finishes, the plugin creates a new session in the same directory, moves all remaining entries there, and switches the TUI to it. The new session starts with an empty conversation. Each entry keeps its selected agent, model, thinking variant, and attachments.
+`/queue:carry` adds a fresh-session boundary to the queue. When it reaches the front, the plugin checks the live session status and waits for the current run and any in-flight replays to finish. It then creates a session in the current directory, transfers the remaining queue, and switches the TUI to it.
+
+The new session starts with an empty conversation. Each entry keeps its selected agent, model, thinking variant, and attachments. If a carry is cancelled or its transfer fails after session creation, the plugin removes the unused new session.
 
 For example, while the first task is running:
 

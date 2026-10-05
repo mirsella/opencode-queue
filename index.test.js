@@ -1,12 +1,13 @@
 import assert from "node:assert/strict"
-import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { createHash, randomUUID } from "node:crypto"
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 import { QueuePlugin } from "./index.ts"
 
 const model = { providerID: "test", modelID: "model" }
+const instances = new Set()
 
 const deferred = () => {
   let resolve, reject
@@ -14,12 +15,18 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 
-const output = (id, text) => ({
-  message: { id, agent: "build", model },
+const output = (id, text, sessionID = "session") => ({
+  message: { id, sessionID, agent: "build", model },
   parts: [{ id: `${id}-part`, type: "text", text }],
 })
 
-const plugin = async (session = {}, project = "project", request = async () => ({ response: new Response() }), known = ["review"]) => {
+const plugin = async (session = {}, {
+  project = "project",
+  directory = `/${project}`,
+  serverUrl = new URL(`http://${randomUUID()}`),
+  request = async () => ({ response: new Response() }),
+  command = {},
+} = {}) => {
   const toasts = []
   const selected = []
   const client = {
@@ -35,12 +42,12 @@ const plugin = async (session = {}, project = "project", request = async () => (
       executeCommand: async () => undefined,
     },
     command: {
-      list: async () => {
-        if (!known) return { data: undefined, error: { message: "command list unavailable" } }
-        return { data: known.map((name) => ({ name, template: "" })) }
-      },
+      list: async () => ({ data: [{ name: "review", template: "" }] }),
+      ...command,
     },
     session: {
+      get: async () => ({ data: { directory } }),
+      delete: async () => undefined,
       messages: async () => ({ data: [] }),
       status: async () => ({ data: {} }),
       prompt: async () => undefined,
@@ -50,13 +57,12 @@ const plugin = async (session = {}, project = "project", request = async () => (
       ...session,
     },
   }
-  const hooks = await QueuePlugin({ client, directory: `/${project}`, project: { id: project } })
-  hooks.toasts = toasts
-  hooks.selected = selected
-  return hooks
+  const hooks = await QueuePlugin({ client, directory, project: { id: project }, serverUrl })
+  instances.add(hooks)
+  return { ...hooks, toasts, selected }
 }
 
-const chat = (hooks, id, text, sessionID = "session") => hooks["chat.message"]({ sessionID, agent: "build", model }, output(id, text))
+const chat = (hooks, id, text, sessionID = "session") => hooks["chat.message"]({ sessionID, agent: "build", model }, output(id, text, sessionID))
 const busy = (hooks, sessionID = "session") => hooks.event({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } })
 const idle = (hooks, sessionID = "session") => hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
 const list = async (hooks, sessionID = "session") => {
@@ -81,6 +87,8 @@ const isolated = (name, run) =>
     try {
       await run(data)
     } finally {
+      await Promise.all([...instances].map((hooks) => hooks.dispose()))
+      instances.clear()
       if (previous === undefined) delete process.env.XDG_DATA_HOME
       else process.env.XDG_DATA_HOME = previous
       if (previousAlways === undefined) delete process.env.OPENCODE_QUEUE_ALWAYS
@@ -96,7 +104,7 @@ isolated("restores queued items and stopped state after restart", async () => {
 
   const second = await plugin()
   assert.equal(await list(second), "1. survive restart\nQueue is stopped")
-  const transformed = { messages: [{ info: { id: "queued" } }, { info: { id: "other" } }] }
+  const transformed = { messages: ["queued", "other"].map((id) => ({ info: output(id, "").message })) }
   await second["experimental.chat.messages.transform"]({}, transformed)
   assert.deepEqual(transformed.messages.map((message) => message.info.id), ["other"])
 
@@ -108,7 +116,7 @@ isolated("restores queued items and stopped state after restart", async () => {
 isolated("persists global always mode and bypasses it with now", async () => {
   const first = await plugin()
   await chat(first, "always-on", "/queue:always-on")
-  const hooks = await plugin({}, "other-project")
+  const hooks = await plugin({}, { project: "other-project" })
   await chat(hooks, "always-status", "/queue:always")
   assert.equal(hooks.toasts.at(-1), "Always queue is on globally")
   await busy(hooks)
@@ -136,7 +144,7 @@ isolated("persists global always mode and bypasses it with now", async () => {
 })
 
 isolated("environment always mode works without creating global settings", async (data) => {
-  const other = await plugin({}, "other-project")
+  const other = await plugin({}, { project: "other-project" })
   process.env.OPENCODE_QUEUE_ALWAYS = "1"
   const local = await plugin()
   delete process.env.OPENCODE_QUEUE_ALWAYS
@@ -164,7 +172,7 @@ isolated("environment always mode works without creating global settings", async
 
 for (const [value, enabled] of [["1", true], ["0", false]]) {
   isolated(`environment always mode ${enabled} stays local through runtime toggles`, async (data) => {
-    const global = await plugin({}, "global-project")
+    const global = await plugin({}, { project: "global-project" })
     const initialCommand = enabled ? "queue:always-on" : "queue:always-off"
     const toggledCommand = enabled ? "queue:always-off" : "queue:always-on"
     await control(global, toggledCommand)
@@ -175,7 +183,7 @@ for (const [value, enabled] of [["1", true], ["0", false]]) {
     const local = await plugin()
     const peer = await plugin()
     delete process.env.OPENCODE_QUEUE_ALWAYS
-    const ordinary = await plugin({}, "ordinary-project")
+    const ordinary = await plugin({}, { project: "ordinary-project" })
     const status = `Always queue is ${enabled ? "on" : "off"} for this instance (OPENCODE_QUEUE_ALWAYS)`
     assert.equal(await control(local, "queue:always"), status)
     await busy(local)
@@ -478,6 +486,59 @@ isolated("apply_model rejects arguments and attachments", async () => {
   assert.equal(hooks.toasts.at(-1), "Queue apply_model does not accept input")
 })
 
+isolated("unchanged queue edits avoid storage writes while new placeholders remain durable", async (data) => {
+  const hooks = await plugin()
+  await busy(hooks)
+  await control(hooks, "queue:stop")
+  await chat(hooks, "queued", "/queue waiting")
+  await control(hooks, "queue:carry")
+  const path = join(data, "opencode", "opencode-queue", `${createHash("sha256").update("project").digest("hex")}.json`)
+  const before = await stat(path)
+
+  await control(hooks, "queue:stop")
+  await assert.rejects(
+    hooks["command.execute.before"]({ sessionID: "session", command: "queue:clear", arguments: "99" }, { parts: [] }),
+    (response) => response.status === 204,
+  )
+  assert.equal(hooks.toasts.at(-1), "Queue item 99 does not exist")
+  await assert.rejects(chat(hooks, "apply", "/queue:apply_model"), (response) => response.status === 204)
+  assert.equal(hooks.toasts.at(-1), "Applied test/model to 1 queued item")
+  assert.equal((await stat(path)).ino, before.ino)
+
+  const placeholder = output("listing", "/queue:list")
+  await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, placeholder)
+  assert.equal(placeholder.parts[0].ignored, true)
+  assert.notEqual((await stat(path)).ino, before.ino)
+  const stored = JSON.parse(await readFile(path, "utf8"))
+  assert.deepEqual(stored.sessions.session.items.map(({ kind }) => kind), ["prompt", "carry"])
+  assert.deepEqual(stored.sessions.session.hidden, ["queued", "listing"])
+
+  const listed = await stat(path)
+  await chat(hooks, "listing", "/queue:list")
+  assert.equal((await stat(path)).ino, listed.ino)
+  await control(hooks, "queue:start")
+  const started = await stat(path)
+  await control(hooks, "queue:start")
+  assert.equal((await stat(path)).ino, started.ino)
+})
+
+isolated("numbered clears remove mixed entry kinds in one pass and retain their original order", async () => {
+  const hooks = await plugin()
+  await control(hooks, "queue:stop")
+  await chat(hooks, "first", "/queue first")
+  await control(hooks, "queue:carry")
+  await chat(hooks, "shell", "/queue !pwd")
+  await chat(hooks, "second", "/queue second")
+  await chat(hooks, "compact", "/queue /compact")
+  await assert.rejects(
+    hooks["command.execute.before"]({ sessionID: "session", command: "queue:clear", arguments: "5 2 2" }, { parts: [] }),
+    (response) => response.status === 204,
+  )
+  assert.equal(hooks.toasts.at(-1), "Cleared queued items 2, 5")
+  assert.equal(await list(hooks), "1. first\n2. !pwd\n3. second\nQueue is stopped")
+  assert.equal(await list(await plugin()), "1. first\n2. !pwd\n3. second\nQueue is stopped")
+})
+
 isolated("runs trailing slash commands directly when idle and queues them when busy", async () => {
   const hooks = await plugin()
   const direct = output("direct", "changes /queue")
@@ -530,7 +591,9 @@ isolated("sends a queued command as a prompt when the command no longer exists",
 
 isolated("replays a queued command normally when the command list is unavailable", async () => {
   const executed = []
-  const hooks = await plugin({ command: async ({ body }) => executed.push(body.command) }, "project", undefined, null)
+  const hooks = await plugin({ command: async ({ body }) => executed.push(body.command) }, {
+    command: { list: async () => ({ error: { message: "command list unavailable" } }) },
+  })
   await busy(hooks)
   await chat(hooks, "review", "/queue /review changes")
   await chat(hooks, "flush", "/queue:flush")
@@ -753,7 +816,7 @@ isolated("keeps an in-flight item durable until replay succeeds", async () => {
 
   const recovered = await plugin()
   assert.equal(await list(recovered), "1. retry after crash\nQueue is stopped")
-  const transformed = { messages: [{ info: { id: "concurrent-flush" } }] }
+  const transformed = { messages: [{ info: output("concurrent-flush", "").message }] }
   await recovered["experimental.chat.messages.transform"]({}, transformed)
   assert.deepEqual(transformed.messages, [])
 
@@ -908,7 +971,7 @@ isolated("lists, restores, and removes individual carry boundaries", async () =>
   await chat(current, "second", "/queue /review changes")
   const boundary = output("boundary", "/queue:carry")
   await current["chat.message"]({ sessionID: "session", agent: "plan", model: { providerID: "other", modelID: "other" }, variant: "high" }, boundary)
-  assert.deepEqual(boundary.message, { id: "boundary", ...prior })
+  assert.deepEqual(boundary.message, { id: "boundary", sessionID: "session", ...prior })
   assert.equal(boundary.parts[0].ignored, true)
   await chat(current, "third", "/queue !pwd")
   await chat(current, "front", "/queue:carry-front")
@@ -936,9 +999,331 @@ isolated("carry placeholders retain the latest usable assistant context", async 
   await busy(current)
   const message = output("carry", "/queue:carry")
   await current["chat.message"]({ sessionID: "session", agent: "build", model }, message)
-  assert.deepEqual(message.message, { id: "carry", agent: "plan", model: { providerID: "other", modelID: "reasoner" }, variant: "high" })
+  assert.deepEqual(message.message, { id: "carry", sessionID: "session", agent: "plan", model: { providerID: "other", modelID: "reasoner" }, variant: "high" })
   assert.equal(message.parts[0].ignored, true)
   assert.equal(await list(current), "1. --- carry: new session 1 ---")
+})
+
+isolated("automatic carry waits for a busy session even when its busy event was missed", async () => {
+  const checking = deferred()
+  const switched = deferred()
+  let running = true
+  let created = 0
+  const current = await plugin({
+    status: async () => {
+      checking.resolve()
+      return { data: running ? { session: { type: "busy" } } : {} }
+    },
+    create: async () => ({ data: { id: `next-${++created}` } }),
+  }, { request: async () => {
+    switched.resolve()
+    return { response: new Response() }
+  } })
+  await control(current, "queue:carry")
+  await checking.promise
+  assert.match(await control(current, "queue:flush"), /waiting for carry/)
+  assert.equal(created, 0)
+  assert.equal(await list(current), "1. --- carry: new session 1 ---")
+
+  running = false
+  await idle(current)
+  await switched.promise
+  assert.equal(created, 1)
+  assert.deepEqual(current.selected, ["next-1"])
+  assert.equal(await list(current), "Queue is empty")
+})
+
+for (const active of [false, true]) {
+  isolated(`automatic carry respects live events during status checks, busy: ${active}`, async () => {
+    const checking = deferred()
+    const checked = deferred()
+    const switched = deferred()
+    let created = 0
+    const current = await plugin({
+      status: () => { checking.resolve(); return checked.promise },
+      create: async () => ({ data: { id: `next-${++created}` } }),
+    }, { request: async () => {
+      switched.resolve()
+      return { response: new Response() }
+    } })
+    await control(current, "queue:carry")
+    await checking.promise
+    await (active ? busy(current) : idle(current))
+    checked.resolve({ data: active ? {} : { session: { type: "busy" } } })
+    if (!active) await switched.promise
+    assert.equal(await list(current), active ? "1. --- carry: new session 1 ---" : "Queue is empty")
+    assert.equal(created, active ? 0 : 1)
+  })
+}
+
+isolated("moving a session keeps its live queue in an already-open directory", async () => {
+  const serverUrl = new URL("http://test-server")
+  let directory = "/project"
+  const replayed = []
+  const checked = []
+  const session = {
+    get: async () => ({ data: { directory } }),
+    prompt: async (input) => replayed.push({ kind: "prompt", ...input }),
+    command: async (input) => replayed.push({ kind: "command", ...input }),
+    shell: async (input) => replayed.push({ kind: "shell", ...input }),
+    summarize: async (input) => replayed.push({ kind: "compact", ...input }),
+    status: async ({ query }) => {
+      checked.push(query.directory)
+      return { data: {} }
+    },
+    create: async ({ query }) => {
+      assert.equal(query.directory, directory)
+      return { data: { id: "next" } }
+    },
+  }
+  const [source, destination] = await Promise.all([
+    plugin(session, { serverUrl }),
+    plugin(session, { serverUrl, directory: "/worktree" }),
+  ])
+  await control(source, "queue:stop")
+  const attachment = { type: "file", mime: "text/plain", url: "file:///project/notes.txt" }
+  const selected = { agent: "plan", model: { providerID: "other", modelID: "reasoner" }, variant: "high" }
+  const queued = output("queued", "/queue keep this")
+  queued.parts.push(attachment)
+  await source["chat.message"]({ sessionID: "session", ...selected }, queued)
+  await chat(source, "command", "/queue /review changes")
+  await chat(source, "shell", "/queue !pwd")
+  await chat(source, "compact", "/queue /compact")
+  await control(source, "queue:carry")
+  await chat(source, "after-carry", "/queue next task")
+
+  directory = "/worktree"
+  const expected = "1. keep this\n2. /review changes\n3. !pwd\n4. /compact\n5. --- carry: new session 1 ---\n6. next task\nQueue is stopped"
+  assert.equal(await list(destination), expected)
+  // A write in the destination must also preserve queues for other sessions.
+  await control(destination, "queue:stop", "other")
+  await chat(destination, "other", "/queue separate task", "other")
+  assert.equal(await list(source), expected)
+  const transformed = { messages: ["queued", "visible"].map((id) => ({ info: output(id, "").message })) }
+  await destination["experimental.chat.messages.transform"]({}, transformed)
+  assert.deepEqual(transformed.messages.map(({ info }) => info.id), ["visible"])
+
+  // Even a replay initiated by the old instance must use the moved directory.
+  await control(source, "queue:flush")
+  assert.deepEqual(replayed.map(({ kind, path, query }) => [kind, path.id, query.directory]).sort(), [
+    ["prompt", "session", "/worktree"], ["command", "session", "/worktree"],
+    ["shell", "session", "/worktree"], ["compact", "session", "/worktree"],
+  ].sort())
+  const prompt = replayed.find(({ kind }) => kind === "prompt").body
+  assert.deepEqual(prompt.model, selected.model)
+  assert.equal(prompt.agent, selected.agent)
+  assert.equal(prompt.variant, selected.variant)
+  assert.deepEqual(prompt.parts[1], { ...attachment, id: undefined })
+  await control(source, "queue:flush")
+  assert.deepEqual(checked.sort(), ["/project", "/worktree"])
+  assert.equal(await list(destination), "Queue is empty\nQueue is stopped")
+  assert.equal(await list(destination, "next"), "1. next task\nQueue is stopped")
+  assert.deepEqual(source.selected, ["next"])
+
+  await source.dispose()
+  await destination.dispose()
+  const restored = await plugin(session, { serverUrl, directory })
+  assert.equal(await list(restored, "next"), "1. next task\nQueue is stopped")
+  assert.equal(await list(restored, "other"), "1. separate task\nQueue is stopped")
+})
+
+for (const scenario of [
+  { caller: "/project", target: "/worktree", runner: "/project", observed: false },
+  { caller: "/worktree", target: "/worktree", runner: "/project", observed: true },
+  { caller: "/worktree", target: "/second-worktree", runner: "/project", observed: true },
+  { caller: "/project", target: "/worktree", runner: "/worktree", observed: true },
+]) {
+  isolated(`carry from ${scenario.caller} waits for a run in ${scenario.runner} after moving to ${scenario.target}`, async () => {
+    const serverUrl = new URL("http://test-server")
+    const checked = []
+    const created = []
+    let running = true
+    const session = {
+      get: async () => ({ data: { directory: scenario.target } }),
+      status: async ({ query }) => {
+        checked.push(query.directory)
+        return { data: running && query.directory === scenario.runner ? { session: { type: "busy" } } : {} }
+      },
+      create: async ({ query }) => {
+        created.push(query.directory)
+        return { data: { id: "next" } }
+      },
+    }
+    const source = await plugin(session, { serverUrl })
+    const destination = await plugin(session, { serverUrl, directory: "/worktree" })
+    if (scenario.observed) await busy(scenario.runner === "/project" ? source : destination)
+    await control(source, "queue:stop")
+    await control(source, "queue:carry")
+    await chat(source, "next-task", "/queue next task")
+
+    const caller = scenario.caller === "/project" ? source : destination
+    assert.match(await control(caller, "queue:flush"), /waiting for carry/)
+    assert.deepEqual(created, [])
+    assert.equal(await list(destination), "1. --- carry: new session 1 ---\n2. next task\nQueue is stopped")
+    const expected = new Set([scenario.caller, scenario.target])
+    if (scenario.observed) expected.add(scenario.runner)
+    assert.deepEqual(checked.sort(), [...expected].sort())
+
+    running = false
+    assert.equal(await control(caller, "queue:flush"), "Carried queue to a new session")
+    assert.deepEqual(created, [scenario.target])
+    assert.equal(await list(destination), "Queue is empty\nQueue is stopped")
+    assert.equal(await list(destination, "next"), "1. next task\nQueue is stopped")
+    assert.deepEqual(caller.selected, ["next"])
+  })
+}
+
+isolated("moving during replay preserves the in-flight item and avoids requeueing across instances", async () => {
+  const serverUrl = new URL("http://test-server")
+  const started = deferred()
+  const finished = deferred()
+  let directory = "/project"
+  let source, destination
+  const replayed = []
+  const session = {
+    get: async () => ({ data: { directory } }),
+    prompt: async ({ path, query, body }) => {
+      const hooks = query.directory === "/project" ? source : destination
+      const message = { ...output(`replay-${replayed.length}`, "", path.id), parts: body.parts }
+      await hooks["chat.message"]({ sessionID: path.id, ...body }, message)
+      replayed.push([query.directory, message.parts[0].text])
+      if (replayed.length === 1) {
+        started.resolve()
+        await finished.promise
+      }
+      await idle(hooks)
+    },
+  }
+  source = await plugin(session, { serverUrl })
+  await control(source, "queue:always-on")
+  await busy(source)
+  await chat(source, "first", "/queue first")
+  const flushing = control(source, "queue:flush")
+  await started.promise
+  await chat(source, "second", "/queue second")
+
+  directory = "/worktree"
+  await source.dispose()
+  destination = await plugin(session, { serverUrl, directory })
+  await source.dispose()
+  assert.equal(await list(destination), "1. second")
+  await chat(destination, "third", "/queue third")
+  await control(destination, "queue:flush")
+  assert.deepEqual(replayed, [["/project", "first"], ["/worktree", "second"], ["/worktree", "third"]])
+  assert.equal(await list(await plugin()), "1. first")
+
+  finished.resolve()
+  await flushing
+  assert.equal(await list(await plugin()), "Queue is empty")
+  assert.equal(replayed.length, 3)
+})
+
+isolated("keeps pending input ordered when the destination attaches after source disposal", async () => {
+  const serverUrl = new URL("http://test-server")
+  const started = deferred()
+  const inspected = deferred()
+  let inspections = 0
+  const session = {
+    messages: async () => {
+      if (inspections++) return { data: [] }
+      started.resolve()
+      return inspected.promise
+    },
+  }
+  const source = await plugin(session, { serverUrl })
+  await busy(source)
+  const first = chat(source, "first", "/queue first")
+  await started.promise
+  await source.dispose()
+  const destination = await plugin(session, { serverUrl, directory: "/worktree" })
+  const second = chat(destination, "second", "/queue second")
+  await new Promise(setImmediate)
+  assert.equal(inspections, 1)
+  inspected.resolve({ data: [] })
+  await Promise.all([first, second])
+  assert.equal(await list(destination), "1. first\n2. second")
+})
+
+isolated("finishes a pending replay after disposal without starting more work", async () => {
+  const serverUrl = new URL("http://test-server")
+  const started = deferred()
+  const finished = deferred()
+  let sent = 0
+  const current = await plugin({
+    prompt: async () => {
+      sent++
+      started.resolve()
+      await finished.promise
+      await idle(current)
+    },
+  }, { serverUrl })
+  await busy(current)
+  await chat(current, "first", "/queue first")
+  const flushing = control(current, "queue:flush")
+  await started.promise
+  await chat(current, "second", "/queue second")
+  await current.dispose()
+  finished.resolve()
+  await flushing
+  assert.equal(sent, 1)
+
+  const restored = await plugin({ prompt: () => assert.fail("an unowned queue must restore without auto-replay") }, { serverUrl })
+  await chat(restored, "third", "/queue third")
+  assert.equal(await list(restored), "1. second\n2. third")
+})
+
+isolated("resolves the session and command list once per replay batch", async () => {
+  let lookups = 0
+  let listings = 0
+  const replayed = []
+  const current = await plugin({
+    get: async () => {
+      lookups++
+      return { data: { directory: "/worktree" } }
+    },
+    prompt: async (request) => replayed.push(request),
+    command: async (request) => replayed.push(request),
+  }, {
+    command: { list: async ({ query }) => {
+      listings++
+      assert.equal(query.directory, "/worktree")
+      return { data: [{ name: "review", template: "" }] }
+    } },
+  })
+  await control(current, "queue:stop")
+  await chat(current, "first", "/queue /review first")
+  await chat(current, "second", "/queue /review second")
+  await chat(current, "third", "/queue third")
+  assert.equal(await control(current, "queue:flush"), "Flushed 3 queued items")
+  assert.equal(lookups, 1)
+  assert.equal(listings, 1)
+  assert.equal(replayed.length, 3)
+  assert.ok(replayed.every(({ query }) => query.directory === "/worktree"))
+})
+
+isolated("keeps the entire batch and reports once when its directory cannot be resolved", async () => {
+  let failing = true
+  let lookups = 0
+  let sent = 0
+  const current = await plugin({
+    get: async () => {
+      lookups++
+      if (failing) throw new Error("session lookup failed")
+      return { data: { directory: "/project" } }
+    },
+    prompt: async () => { sent++ },
+  })
+  await control(current, "queue:stop")
+  await chat(current, "first", "/queue first")
+  await chat(current, "second", "/queue second")
+  assert.equal(await control(current, "queue:flush"), "Flushed 0 queued items; 2 failed")
+  assert.equal(lookups, 1)
+  assert.equal(sent, 0)
+  assert.equal(current.toasts.filter((message) => message === "Queue failed: session lookup failed").length, 1)
+  assert.equal(await list(await plugin()), "1. first\n2. second\nQueue is stopped")
+  failing = false
+  assert.equal(await control(current, "queue:flush"), "Flushed 2 queued items")
+  assert.equal(sent, 2)
 })
 
 isolated("carries a chain into fresh sessions only after each prompt finishes", async (data) => {
@@ -952,7 +1337,7 @@ isolated("carries a chain into fresh sessions only after each prompt finishes", 
     },
     prompt: async ({ path, body }) => {
       const index = replayed.length
-      const message = { ...output(`replay-${index}`, ""), parts: body.parts }
+      const message = { ...output(`replay-${index}`, "", path.id), parts: body.parts }
       await current["chat.message"]({ sessionID: path.id, ...body }, message)
       replayed.push({ sid: path.id, body })
       await busy(current, path.id)
@@ -1048,10 +1433,10 @@ isolated("an idle carry creates and selects an empty session without prompting",
   const current = await plugin({
     create: async () => ({ data: { id: "next" } }),
     prompt: () => assert.fail("carry must not reach the agent"),
-  }, "project", async () => {
+  }, { request: async () => {
     switched.resolve()
     return { response: new Response() }
-  })
+  } })
   await assert.rejects(
     current["command.execute.before"]({ sessionID: "session", command: "queue:carry", arguments: "" }, { parts: [] }),
     (response) => response.status === 204,
@@ -1095,8 +1480,10 @@ isolated("carries consecutive boundaries and replays every input kind in the des
 for (const failure of ["status", "create", "commit"]) {
   isolated(`carry preserves and retries the whole queue after a failed ${failure}`, async (data) => {
     const storage = join(data, "opencode", "opencode-queue")
+    const removed = []
     let failing = true
     const current = await plugin({
+      delete: async ({ path }) => removed.push(path.id),
       status: async () => {
         if (failing && failure === "status") throw new Error("status check failed")
         return { data: {} }
@@ -1121,6 +1508,7 @@ for (const failure of ["status", "create", "commit"]) {
     assert.equal(await list(current, "next"), "Queue is empty")
     assert.equal(await list(await plugin()), expected)
     assert.deepEqual(current.selected, [])
+    assert.deepEqual(removed, failure === "commit" ? ["next"] : [])
 
     failing = false
     await chat(current, "retry", "/queue:flush")
@@ -1129,6 +1517,7 @@ for (const failure of ["status", "create", "commit"]) {
     assert.equal(await list(restored), "Queue is empty\nQueue is stopped")
     assert.equal(await list(restored, "next"), "1. keep this\nQueue is stopped")
     assert.deepEqual(current.selected, ["next"])
+    assert.deepEqual(removed, failure === "commit" ? ["next"] : [])
   })
 }
 
@@ -1214,8 +1603,10 @@ for (const stage of ["status", "create"]) for (const action of ["clear", "busy",
   isolated(`does not transfer work after ${action} during session ${stage}`, async () => {
     const started = deferred()
     const finished = deferred()
+    const removed = []
     const current = await plugin({
       create: () => assert.fail("cancelled status checks must not create a session"),
+      delete: async (request) => removed.push(request),
       [stage]: () => { started.resolve(); return finished.promise },
     })
     await chat(current, "pause", "/queue:stop")
@@ -1232,13 +1623,39 @@ for (const stage of ["status", "create"]) for (const action of ["clear", "busy",
     if (stage === "status" && action === "busy") assert.match(current.toasts.at(-1), /waiting for carry/)
     else assert.equal(current.toasts.at(-1), "Carry deferred because the queue or session changed")
     assert.deepEqual(current.selected, [])
+    assert.deepEqual(removed, stage === "create" ? [{ path: { id: "next" }, query: { directory: "/project" }, throwOnError: true }] : [])
     assert.equal(await list(current, "next"), "Queue is empty")
     if (action === "busy" || action === "error") assert.equal(await list(current), "1. --- carry: new session 1 ---\n2. keep this\nQueue is stopped")
   })
 }
 
+isolated("an unused carry session cleanup failure does not prevent cancellation", async () => {
+  const started = deferred()
+  const created = deferred()
+  let removed = 0
+  const current = await plugin({
+    create: () => { started.resolve(); return created.promise },
+    delete: async () => { removed++; throw new Error("delete failed") },
+  })
+  await control(current, "queue:stop")
+  await control(current, "queue:carry")
+  const flushing = control(current, "queue:flush")
+  await started.promise
+  await control(current, "queue:clear")
+  created.resolve({ data: { id: "next" } })
+  assert.equal(await flushing, "Carry deferred because the queue or session changed")
+  assert.equal(removed, 1)
+  assert.equal(await list(current), "Queue is empty\nQueue is stopped")
+  assert.deepEqual(current.selected, [])
+})
+
 isolated("a TUI selection failure does not undo a committed carry", async () => {
-  const current = await plugin({ create: async () => ({ data: { id: "next" } }) }, "project", async () => ({ response: new Response(null, { status: 500 }) }))
+  const current = await plugin({
+    create: async () => ({ data: { id: "next" } }),
+    delete: () => assert.fail("a committed carry session must not be removed"),
+  }, {
+    request: async () => ({ response: new Response(null, { status: 500 }) }),
+  })
   await chat(current, "stop", "/queue:stop")
   await chat(current, "carry", "/queue:carry")
   await chat(current, "next", "/queue keep this")

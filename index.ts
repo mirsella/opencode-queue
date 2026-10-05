@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import type { AgentPartInput, FilePart, FilePartInput, SubtaskPartInput, TextPart, TextPartInput } from "@opencode-ai/sdk"
+import type { AgentPartInput, FilePart, FilePartInput, SessionCommandData, SubtaskPartInput, TextPart, TextPartInput } from "@opencode-ai/sdk"
 import { HttpServerResponse } from "effect/unstable/http"
 import { createHash, randomUUID } from "node:crypto"
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
@@ -61,13 +61,17 @@ type ControlOp =
   | { kind: "stop" }
   | { kind: "always"; enabled?: boolean }
 
-type Activity = { readonly kind: "idle" | "restored" | "busy" }
+type Activity = { readonly kind: "idle" | "restored" } | { readonly kind: "busy"; readonly directory: string }
 type Carrying = { kind: "carrying"; item: Extract<Item, { kind: "carry" }>; automatic: boolean }
 type Sending = { kind: "sending"; batches: { items: ReplayItem[]; pending: boolean }[] }
-type State = { items: Item[]; activity: Activity; flight?: Carrying | Sending; stopped: boolean; failed: boolean; hidden: Set<string> }
+type State = { items: readonly Item[]; activity: Activity; flight?: Carrying | Sending; stopped: boolean; failed: boolean; hidden: Set<string> }
 type Draft = Pick<State, "items" | "stopped" | "hidden">
-type Store = { version: 1; projectID: string; sessions: Record<string, { items: Item[]; stopped: boolean; hidden: string[] }> }
+type Store = { version: 1; projectID: string; sessions: Record<string, { items: readonly Item[]; stopped: boolean; hidden: string[] }> }
 type Placeholder = { id: string; part: TextPart }
+type Target = { path: { id: string }; query: { directory: string } }
+
+// OpenCode creates a plugin instance per directory, even for the same project.
+const runtimes = new Map<string, ReturnType<typeof openQueues>>()
 
 type Op =
   | ControlOp
@@ -178,7 +182,7 @@ const itemText = (item: Item) => {
   const count = item.parts.filter((part) => part.type === "file").length
   return body || `${count} attachment${count === 1 ? "" : "s"}`
 }
-const describeQueue = (state?: Draft) => {
+const describeQueue = (state?: Pick<State, "items" | "stopped">) => {
   let boundary = 0
   const list = state?.items.map((item, i) => `${i + 1}. ${item.kind === "carry" ? `--- carry: new session ${++boundary} ---` : itemText(item)}`).join("\n") || "Queue is empty"
   return state?.stopped ? `${list}\nQueue is stopped` : list
@@ -282,23 +286,20 @@ const alwaysSetting = (path: string) => {
   }
 }
 
-export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
+const openQueues = (key: string, path: string, projectID: string) => {
   const sessions = new Map<string, State>()
   const deleted = new Set<string>()
   const inputTurns = new Map<string, Promise<unknown>>()
-  const internalCommands: { sid: string; command: string; args: string; used: boolean }[] = []
-  const origin = randomUUID()
-  const post = (client as unknown as { _client?: { post?: Post } })._client?.post
-  const root = join(dataHome(), "opencode", "opencode-queue")
-  const path = join(root, `${createHash("sha256").update(project.id).digest("hex")}.json`)
-  const always = alwaysSetting(join(root, "settings.json"))
+  const internalCommands = new Set<{ sid: string; command: string; args: string }>()
+  const instances = new Set<symbol>()
   let writes = Promise.resolve()
-
-  try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
-    if (!record(parsed) || parsed.version !== 1 || parsed.projectID !== project.id || !record(parsed.sessions)) {
-      console.warn("QueuePlugin ignored invalid queue storage", path)
-    } else {
+  const ready = (async () => {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
+      if (!record(parsed) || parsed.version !== 1 || parsed.projectID !== projectID || !record(parsed.sessions)) {
+        console.warn("QueuePlugin ignored invalid queue storage", path)
+        return
+      }
       for (const [sid, value] of Object.entries(parsed.sessions)) {
         if (!record(value) || typeof value.stopped !== "boolean" || !Array.isArray(value.items)) {
           console.warn("QueuePlugin skipped invalid stored session", sid)
@@ -312,14 +313,28 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         const activity: Activity = { kind: items.length && !value.stopped ? "restored" : "idle" }
         if (items.length || value.stopped || hidden.size) sessions.set(sid, { items, activity, stopped: value.stopped, failed: false, hidden })
       }
+    } catch (error) {
+      if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load queue storage", error)
     }
-  } catch (error) {
-    if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load queue storage", error)
+  })()
+
+  const unused = () => {
+    if (instances.size || inputTurns.size) return false
+    for (const current of sessions.values()) if (current.flight) return false
+    return true
   }
+  // A directory can detach before its pending input or replay has finished.
+  const retire = async () => {
+    if (!unused()) return
+    const pending = writes
+    await pending
+    if (pending === writes && unused() && runtimes.get(key) === queues) runtimes.delete(key)
+  }
+
   // Call inside serialize: publish drafts in memory only after the atomic disk write.
   const commit = async (...updates: [State, Draft][]) => {
     const drafts = new Map(updates)
-    const stored: Store = { version: 1, projectID: project.id, sessions: {} }
+    const stored: Store = { version: 1, projectID, sessions: {} }
     for (const [id, current] of sessions) {
       if (deleted.has(id)) continue
       const durable = drafts.get(current) ?? current
@@ -333,6 +348,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   const serialize = <T>(action: () => Promise<T>) => {
     const transaction = writes.then(action)
     writes = transaction.then(() => undefined, () => undefined)
+    if (!instances.size) void writes.then(retire)
     return transaction
   }
 
@@ -345,29 +361,59 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     return current
   }
 
-  const automaticallyQueue = async (sid: string) => shouldQueue(sessions.get(sid)) && (await always.get())
-
-  const persist = <T>(sid: string, placeholder: Placeholder | undefined, mutate: (draft: Draft) => T) =>
+  const persist = <T>(sid: string, placeholder: Placeholder | undefined, mutate: (draft: Pick<State, "items" | "stopped">) => T) =>
     serialize(async () => {
       if (deleted.has(sid)) throw new Error(`QueuePlugin cannot persist queue state for deleted session ${sid}`)
       const current = state(sid)
-      const draft: Draft = { items: [...current.items], stopped: current.stopped, hidden: new Set(current.hidden) }
-      if (placeholder) draft.hidden.add(placeholder.id)
+      const draft: Draft = { items: current.items, stopped: current.stopped, hidden: current.hidden }
       const value = mutate(draft)
-      await commit([current, draft])
+      if (placeholder && !current.hidden.has(placeholder.id)) draft.hidden = new Set(current.hidden).add(placeholder.id)
+      if (draft.items !== current.items || draft.stopped !== current.stopped || draft.hidden !== current.hidden) await commit([current, draft])
       if (placeholder) Object.assign(placeholder.part, { text: "", synthetic: true, ignored: true })
       return value
     })
 
+  const afterInput = <T>(sid: string, action: () => Promise<T>) => (inputTurns.get(sid) ?? Promise.resolve()).catch(() => undefined).then(action)
+
   const orderedInput = <T>(sid: string, action: () => Promise<T>) => {
-    const turn = (inputTurns.get(sid) ?? Promise.resolve()).catch(() => undefined).then(action)
+    const turn = afterInput(sid, action)
     inputTurns.set(sid, turn)
     return turn.finally(() => {
       if (inputTurns.get(sid) === turn) inputTurns.delete(sid)
+      void retire()
     })
   }
 
-  const afterInput = <T>(sid: string, action: () => Promise<T>) => (inputTurns.get(sid) ?? Promise.resolve()).catch(() => undefined).then(action)
+  const queues = {
+    ready, sessions, deleted, internalCommands, origin: randomUUID(),
+    commit, serialize, state, persist, orderedInput, afterInput, retire,
+    get active() { return instances.size > 0 },
+    attach: () => {
+      const instance = Symbol()
+      instances.add(instance)
+      return async () => {
+        if (instances.delete(instance)) await retire()
+      }
+    },
+  }
+  return queues
+}
+
+export const QueuePlugin: Plugin = async ({ client, project, directory, serverUrl }) => {
+  const post = (client as unknown as { _client?: { post?: Post } })._client?.post
+  const root = join(dataHome(), "opencode", "opencode-queue")
+  const path = join(root, `${createHash("sha256").update(project.id).digest("hex")}.json`)
+  const always = alwaysSetting(join(root, "settings.json"))
+  const key = `${serverUrl.origin}\0${path}`
+  let queues = runtimes.get(key)
+  if (!queues) {
+    queues = openQueues(key, path, project.id)
+    runtimes.set(key, queues)
+  }
+  const dispose = queues.attach()
+  await queues.ready
+  const { sessions, deleted, internalCommands, origin, commit, serialize, state, persist, orderedInput, afterInput } = queues
+  const automaticallyQueue = async (sid: string) => shouldQueue(sessions.get(sid)) && (await always.get())
 
   const toast = (message: string, variant: "info" | "error", duration = 2500) =>
     client.tui.showToast({ body: { message, variant, duration }, query: { directory } }).catch(() => undefined)
@@ -392,21 +438,23 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
   const files = (parts: { type: string }[]) => parts.filter((part): part is FilePart => part.type === "file")
 
-  const clear = (list: Item[], indices: number[]) => {
+  const clear = (draft: Pick<State, "items">, indices: number[]) => {
+    const list = draft.items
     if (!list.length) return "Queue is empty"
 
     if (!indices.length) {
       const count = list.length
-      list.splice(0)
+      draft.items = []
       return `Cleared ${count} queued item${count === 1 ? "" : "s"}`
     }
 
-    const targets = [...new Set(indices)].sort((a, b) => a - b)
-    const missing = targets.filter((index) => index > list.length)
+    const targets = new Set(indices)
+    const ordered = [...targets].sort((a, b) => a - b)
+    const missing = ordered.filter((index) => index > list.length)
     if (missing.length) return `Queue item${missing.length === 1 ? "" : "s"} ${missing.join(", ")} ${missing.length === 1 ? "does" : "do"} not exist`
 
-    for (const index of targets.toReversed()) list.splice(index - 1, 1)
-    return `Cleared queued item${targets.length === 1 ? "" : "s"} ${targets.join(", ")}`
+    draft.items = list.filter((_, index) => !targets.has(index + 1))
+    return `Cleared queued item${targets.size === 1 ? "" : "s"} ${ordered.join(", ")}`
   }
 
   const latest = async (sid: string): Promise<Info | undefined> => {
@@ -433,12 +481,16 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   }
 
   const opts = (info: Info) => ({ agent: info.agent, model: info.model, variant: info.variant })
+  const sessionTarget = async (sid: string): Promise<Target> => {
+    const result = await client.session.get({ path: { id: sid }, throwOnError: true })
+    return { path: { id: sid }, query: { directory: result.data.directory } }
+  }
 
-  const shell = (sid: string, command: string, info: Run) => client.session.shell({ path: { id: sid }, body: { agent: info.agent, model: info.model, command }, throwOnError: true })
+  const shell = (target: Target, command: string, info: Run) => client.session.shell({ ...target, body: { agent: info.agent, model: info.model, command }, throwOnError: true })
   // TUI command events target the focused session; queued replay must target the original session.
-  const compact = (sid: string, info: Info) =>
+  const compact = (target: Target, info: Info) =>
     client.session.summarize({
-      path: { id: sid },
+      ...target,
       body: { providerID: info.model.providerID, modelID: info.model.modelID },
       throwOnError: true,
     })
@@ -448,19 +500,19 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     if (text) text.metadata = { ...text.metadata, [INTERNAL]: origin }
   }
 
-  const callCommand = async <T>(sid: string, command: string, args: string, call: () => Promise<T>) => {
-    const pending = { sid, command, args, used: false }
-    internalCommands.push(pending)
+  const command = async (target: Target, body: NonNullable<SessionCommandData["body"]> & { variant?: string; parts: FilePartInput[] }) => {
+    const pending = { sid: target.path.id, command: body.command, args: body.arguments }
+    internalCommands.add(pending)
     try {
-      return await call()
+      return await client.session.command({ ...target, body, throwOnError: true })
     } finally {
-      internalCommands.splice(internalCommands.indexOf(pending), 1)
+      internalCommands.delete(pending)
     }
   }
 
-  const knownCommands = async (): Promise<Set<string> | undefined> => {
+  const knownCommands = async (target: Target): Promise<Set<string> | undefined> => {
     try {
-      const result = await client.command.list({ query: { directory } })
+      const result = await client.command.list({ query: target.query })
       if (!result.data) {
         console.warn("QueuePlugin could not list commands to validate a queued command", result.error)
         return undefined
@@ -472,46 +524,62 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     }
   }
 
-  const sendPrompt = (sid: string, info: Info, parts: InputPart[]) => {
+  const sendPrompt = (target: Target, info: Info, parts: InputPart[]) => {
     const clone = parts.map((part) => ({ ...part, id: undefined }))
     markInternal(clone)
-    return client.session.prompt({ path: { id: sid }, body: { ...opts(info), parts: clone } as any, throwOnError: true })
+    return client.session.prompt({ ...target, body: { ...opts(info), parts: clone }, throwOnError: true })
   }
 
-  const replay = async (sid: string, item: ReplayItem) => {
-    switch (item.kind) {
-      case "shell":
-        return shell(sid, item.shell, item.info)
-      case "compact":
-        return compact(sid, item.info)
-      case "command": {
-        const known = await knownCommands()
-        // OpenCode answers an unknown command with a generic 500, so retrying it would wedge the queue.
-        if (known && !known.has(item.cmd)) {
-          await toast(`Command /${item.cmd} not found; sending it as a prompt`, "error", 5000)
-          return sendPrompt(sid, item.info, [{ type: "text", text: item.source }, ...item.files])
-        }
-        return callCommand(sid, item.cmd, item.args, () =>
-          client.session.command({
-            path: { id: sid },
-            body: {
-              ...opts(item.info),
-              model: `${item.info.model.providerID}/${item.info.model.modelID}`,
-              command: item.cmd,
-              arguments: item.args,
-              parts: item.files,
-            } as any,
-            throwOnError: true,
-          }),
-        )
-      }
-      case "prompt":
-        return sendPrompt(sid, item.info, item.parts)
+  const replay = async (sid: string, items: ReplayItem[]) => {
+    const failed = (error: unknown) => {
+      console.error("QueuePlugin failed to flush queued input", error)
+      return toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
     }
+    let target: Target
+    try {
+      target = await sessionTarget(sid)
+    } catch (error) {
+      await failed(error)
+      return items
+    }
+    let commands: Promise<Set<string> | undefined> | undefined
+    const send = async (item: ReplayItem) => {
+      switch (item.kind) {
+        case "shell":
+          return shell(target, item.shell, item.info)
+        case "compact":
+          return compact(target, item.info)
+        case "command": {
+          const known = await (commands ??= knownCommands(target))
+          // OpenCode answers an unknown command with a generic 500, so retrying it would wedge the queue.
+          if (known && !known.has(item.cmd)) {
+            await toast(`Command /${item.cmd} not found; sending it as a prompt`, "error", 5000)
+            return sendPrompt(target, item.info, [{ type: "text", text: item.source }, ...item.files])
+          }
+          return command(target, {
+            ...opts(item.info),
+            model: `${item.info.model.providerID}/${item.info.model.modelID}`,
+            command: item.cmd,
+            arguments: item.args,
+            parts: item.files,
+          })
+        }
+        case "prompt":
+          return sendPrompt(target, item.info, item.parts)
+      }
+    }
+    return (await Promise.all(items.map(async (item) => {
+      try {
+        await send(item)
+      } catch (error) {
+        await failed(error)
+        return item
+      }
+    }))).filter((item) => item !== undefined)
   }
 
   const advance = (sid: string) => {
-    if (deleted.has(sid)) return
+    if (!queues.active || deleted.has(sid)) return
     const current = state(sid)
     if (!canAdvance(current)) return
     void afterInput(sid, () => flush(sid, "next")).catch(async (error) => {
@@ -522,8 +590,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
   const enqueue = async (sid: string, item: Item, front: boolean, placeholder?: Placeholder) => {
     await persist(sid, placeholder, (draft) => {
-      if (front) draft.items.unshift(item)
-      else draft.items.push(item)
+      draft.items = front ? [item, ...draft.items] : [...draft.items, item]
     })
     advance(sid)
     await toast(`${front ? "Queued first" : "Queued"}: ${itemText(item)}`, "info")
@@ -539,18 +606,28 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
   const carry = async (sid: string, current: State, carrying: Carrying) => {
     const eligible = () => !deleted.has(sid) && !current.failed && !(carrying.automatic && current.stopped) && current.items[0] === carrying.item
+    let created: Target | undefined
     let destination: string | undefined
     try {
-      if (!carrying.automatic) {
-        const observed = current.activity
+      const observed = current.activity
+      const target = await sessionTarget(sid)
+      // /move changes the session location without relocating an active runner.
+      const directories = new Set([directory, target.query.directory])
+      if (observed.kind === "busy") directories.add(observed.directory)
+      const statuses = await Promise.all([...directories].map(async (directory) => {
         const result = await client.session.status({ query: { directory }, throwOnError: true })
-        // Live events received during the request take precedence over its snapshot.
-        if (current.activity === observed) current.activity = { kind: !result.data[sid] || result.data[sid].type === "idle" ? "idle" : "busy" }
+        return { directory, status: result.data[sid] }
+      }))
+      // Live events received during the request take precedence over its snapshot.
+      if (current.activity === observed) {
+        const running = statuses.find(({ status }) => status && status.type !== "idle")
+        current.activity = running ? { kind: "busy", directory: running.directory } : { kind: "idle" }
       }
       if (current.activity.kind !== "idle") return "Queue is waiting for carry; the session must finish before continuing in a new session"
       if (!eligible()) return "Carry deferred because the queue or session changed"
-      const created = await client.session.create({ query: { directory }, throwOnError: true })
-      const nextID = created.data.id
+      const resultCreated = await client.session.create({ query: target.query, throwOnError: true })
+      const nextID = resultCreated.data.id
+      created = { path: { id: nextID }, query: target.query }
       destination = await afterInput(sid, () => serialize(async () => {
         if (deleted.has(nextID) || !eligible() || current.activity.kind !== "idle") return undefined
         if (current.flight !== carrying) throw new Error(`QueuePlugin lost track of carry for session ${sid}`)
@@ -567,7 +644,13 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       await toast(`Queue carry failed: ${error instanceof Error ? error.message : String(error)}`, "error", 5000)
       return "Queue carry failed; queued entries were kept for retry"
     } finally {
+      if (created && !destination) {
+        await client.session.delete({ ...created, throwOnError: true }).catch((error) => {
+          console.warn("QueuePlugin failed to remove an unused carry session", error)
+        })
+      }
       current.flight = undefined
+      void queues.retire()
       if (!destination) advance(sid)
     }
 
@@ -592,7 +675,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
     const reservation = await serialize(async () => {
       if (deleted.has(sid)) return undefined
       const current = state(sid)
-      if (automatic && !canAdvance(current)) return undefined
+      if (automatic && (!queues.active || !canAdvance(current))) return undefined
 
       if (current.flight?.kind === "carrying" || (current.items[0]?.kind === "carry" && current.flight)) {
         return "Queue is waiting for carry; the session must finish before continuing in a new session"
@@ -613,35 +696,25 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       if (!automatic) current.failed = false
 
       // Prompt requests stay pending until the agent finishes; new flushes can still steer it.
-      if (!current.flight) current.activity = { kind: "busy" }
+      if (!current.flight) current.activity = { kind: "busy", directory }
       const sending: Sending = current.flight ?? { kind: "sending", batches: [] }
       const batch = { items, pending: true }
       sending.batches.push(batch)
-      current.items.splice(0, items.length)
+      current.items = current.items.slice(items.length)
       current.flight = sending
-      return { kind: "send", current, items, sending, batch } as const
+      return { kind: "send", current, sending, batch } as const
     })
 
     if (!reservation) return "Queue is empty"
     if (typeof reservation === "string") return reservation
     if (reservation.kind === "carry") return carry(sid, reservation.current, reservation.carrying)
 
-    const { current, items, sending, batch } = reservation
-    const retry = (await Promise.all(
-      items.map(async (item) => {
-        try {
-          await replay(sid, item)
-          return undefined
-        } catch (error) {
-          console.error("QueuePlugin failed to flush queued input", error)
-          await toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
-          return item
-        }
-      }),
-    )).filter((item) => item !== undefined)
+    const { current, sending, batch } = reservation
+    const { items } = batch
+    const retry = await replay(sid, items)
     await serialize(async () => {
       if (sessions.get(sid) !== current) return
-      if (current.flight !== sending || !batch.pending || !sending.batches.includes(batch)) throw new Error(`QueuePlugin lost track of in-flight queued items for session ${sid}`)
+      if (current.flight !== sending) throw new Error(`QueuePlugin lost track of in-flight queued items for session ${sid}`)
 
       batch.pending = false
       batch.items = retry
@@ -655,8 +728,10 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       } finally {
         if (!sending.batches.some((entry) => entry.pending)) {
           const queued = sending.batches.flatMap((entry) => entry.items)
-          current.items.unshift(...queued)
-          if (queued.length) current.activity = { kind: "idle" }
+          if (queued.length) {
+            current.items = [...queued, ...current.items]
+            current.activity = { kind: "idle" }
+          }
           current.flight = undefined
         }
       }
@@ -686,7 +761,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         case "list":
           return describeQueue(draft)
         case "clear":
-          return clear(draft.items, op.indices)
+          return clear(draft, op.indices)
         case "stop":
           draft.stopped = true
           return "Queue stopped"
@@ -703,6 +778,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
   }
 
   const hooks: Awaited<ReturnType<Plugin>> = {
+    dispose,
     config: async (cfg) => {
       cfg.command ??= {}
       for (const [name, description] of Object.entries(COMMANDS)) cfg.command[name] = { template: "", description }
@@ -750,7 +826,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       if (deleted.has(sid)) return
       const current = state(sid)
       if (event.properties.status.type !== "idle") {
-        current.activity = { kind: "busy" }
+        current.activity = { kind: "busy", directory }
         if (!current.flight) current.failed = false
         return
       }
@@ -761,11 +837,12 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       const sid = input.sessionID
       const body = input.arguments ?? ""
 
-      const internal = internalCommands.find((pending) => !pending.used && pending.sid === sid && pending.command === input.command && pending.args === body)
-      if (internal) {
-        internal.used = true
-        markInternal(output.parts)
-        return
+      for (const pending of internalCommands) {
+        if (pending.sid === sid && pending.command === input.command && pending.args === body) {
+          internalCommands.delete(pending)
+          markInternal(output.parts)
+          return
+        }
       }
 
       if (!isQueue(input.command)) {
@@ -795,8 +872,9 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
 
       // The command hook lacks the selected model; chat.message applies it and cancels the prompt.
       if (op.kind !== "apply_model" && sendNow(sessions.get(sid), request.command, op)) {
+        const target = { path: { id: sid }, query: { directory } }
         if (op.kind === "shell") {
-          await shell(sid, op.shell, await run(sid))
+          await shell(target, op.shell, await run(sid))
           return handled()
         }
 
@@ -806,7 +884,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         }
 
         if (op.kind === "command") {
-          await callCommand(sid, op.cmd, op.args, () => client.session.command({ path: { id: sid }, body: { command: op.cmd, arguments: op.args, parts } as any }))
+          await command(target, { command: op.cmd, arguments: op.args, parts })
           return handled()
         }
 
@@ -844,11 +922,14 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
         const model = { ...info.model }
         return stop(await orderedInput(sid, () => persist(sid, undefined, (draft) => {
           let count = 0
+          let updated: Item[] | undefined
           for (const [i, item] of draft.items.entries()) {
             if (item.kind === "carry") continue
-            draft.items[i] = { ...item, info: { ...item.info, model, variant: info.variant } }
             count++
+            if (item.info.model.providerID === model.providerID && item.info.model.modelID === model.modelID && item.info.variant === info.variant) continue
+            (updated ??= [...draft.items])[i] = { ...item, info: { ...item.info, model, variant: info.variant } }
           }
+          if (updated) draft.items = updated
           if (!count) return "Queue is empty"
           const label = `${model.providerID}/${model.modelID}${info.variant ? ` (${info.variant})` : ""}`
           return `Applied ${label} to ${count} queued item${count === 1 ? "" : "s"}`
@@ -868,15 +949,16 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       }
 
       if (sendNow(current, request.command, op)) {
+        const target = { path: { id: sid }, query: { directory } }
         if (op.kind === "command") return
         if (op.kind === "compact") {
           await persist(sid, placeholder, () => undefined)
-          await compact(sid, info)
+          await compact(target, info)
           return
         }
         if (op.kind === "shell") {
           await persist(sid, placeholder, () => undefined)
-          await shell(sid, op.shell, info)
+          await shell(target, op.shell, info)
           return
         }
         text.text = request.body
@@ -919,10 +1001,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory }) => {
       })
     },
     "experimental.chat.messages.transform": async (_, output) => {
-      output.messages = output.messages.filter((msg) => {
-        for (const current of sessions.values()) if (current.hidden.has(msg.info.id)) return false
-        return true
-      })
+      output.messages = output.messages.filter((msg) => !sessions.get(msg.info.sessionID)?.hidden.has(msg.info.id))
     },
   }
 
