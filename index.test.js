@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { createHash, randomUUID } from "node:crypto"
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import fs, { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -59,12 +59,25 @@ const plugin = async (session = {}, {
   }
   const hooks = await QueuePlugin({ client, directory, project: { id: project }, serverUrl })
   instances.add(hooks)
-  return { ...hooks, toasts, selected }
+  return { ...hooks, toasts, selected, client }
 }
 
 const chat = (hooks, id, text, sessionID = "session") => hooks["chat.message"]({ sessionID, agent: "build", model }, output(id, text, sessionID))
 const busy = (hooks, sessionID = "session") => hooks.event({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } })
-const idle = (hooks, sessionID = "session") => hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
+let messageClock = 0
+const assistant = (overrides = {}, sessionID = "session") => {
+  const created = ++messageClock
+  return { id: `assistant-${created}`, sessionID, role: "assistant", parentID: "user", time: { created, completed: created + 1 }, finish: "stop", ...overrides }
+}
+const update = (hooks, info) => hooks.event({ event: { type: "message.updated", properties: { info } } })
+const updatePart = (hooks, part) => hooks.event({ event: { type: "message.part.updated", properties: { part } } })
+const finish = (hooks, sessionID = "session") => update(hooks, assistant({}, sessionID))
+const idleEvent = (hooks, sessionID = "session") => hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
+// Most scenarios end a successful model turn. Interruption tests use idleEvent.
+const idle = async (hooks, sessionID = "session") => {
+  await finish(hooks, sessionID)
+  await idleEvent(hooks, sessionID)
+}
 const list = async (hooks, sessionID = "session") => {
   await chat(hooks, `list-${sessionID}`, "/queue:list", sessionID)
   return hooks.toasts.at(-1)
@@ -76,16 +89,15 @@ const control = async (hooks, command, sessionID = "session") => {
   )
   return hooks.toasts.at(-1)
 }
-
 const isolated = (name, run) =>
-  test(name, { concurrency: false }, async () => {
+  test(name, { concurrency: false }, async (t) => {
     const previous = process.env.XDG_DATA_HOME
     const previousAlways = process.env.OPENCODE_QUEUE_ALWAYS
     const data = await mkdtemp(join(tmpdir(), "opencode-queue-"))
     process.env.XDG_DATA_HOME = data
     delete process.env.OPENCODE_QUEUE_ALWAYS
     try {
-      await run(data)
+      await run(data, t)
     } finally {
       await Promise.all([...instances].map((hooks) => hooks.dispose()))
       instances.clear()
@@ -610,7 +622,7 @@ isolated("does not requeue internal replays in always mode", async () => {
   const receive = async (message) => {
     await hooks["chat.message"]({ sessionID: "session", agent: "build", model }, message)
     replayed.push(message.parts[0].text)
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+    await idle(hooks)
     if (replayed.length === 2) done()
   }
   hooks = await plugin({
@@ -625,7 +637,7 @@ isolated("does not requeue internal replays in always mode", async () => {
   await busy(hooks)
   await chat(hooks, "prompt", "first")
   await chat(hooks, "command", "/queue /review changes")
-  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+  await idle(hooks)
   await completed
   assert.deepEqual(replayed, ["first", "ran /review changes"])
 })
@@ -644,6 +656,7 @@ isolated("restores a running queue without replaying until the session finishes"
   assert.equal(await list(second), "1. resume after restart\n2. later")
 
   await busy(second)
+  await finish(second)
   await second.event({ event: { type: "session.status", properties: { sessionID: "session", status: { type: "idle" } } } })
   assert.equal(await replayed, "resume after restart")
   assert.equal(await list(second), "1. later")
@@ -658,37 +671,640 @@ isolated("replays input queued while the session becomes idle", async () => {
   await busy(current)
 
   const queued = chat(current, "queued", "/queue idle race")
-  await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+  await idle(current)
   finishInspection({ data: [] })
   await queued
   assert.equal(await replayed, "idle race")
 })
 
-isolated("keeps delayed input queued after a session error", async () => {
-  let finishInspection
-  const inspection = new Promise((resolve) => (finishInspection = resolve))
-  let finishReplay
-  const replayed = new Promise((resolve) => (finishReplay = resolve))
-  let replays = 0
+for (const type of ["session.error", "question.rejected"]) {
+  isolated(`keeps delayed input queued after ${type}`, async () => {
+    let finishInspection
+    const inspection = new Promise((resolve) => (finishInspection = resolve))
+    let finishReplay
+    const replayed = new Promise((resolve) => (finishReplay = resolve))
+    let replays = 0
+    const current = await plugin({
+      messages: () => inspection,
+      prompt: async ({ body }) => {
+        replays++
+        finishReplay(body.parts[0].text)
+      },
+    })
+    await busy(current)
+
+    const queued = chat(current, "queued", "/queue retry after error")
+    await current.event({ event: { type, properties: { sessionID: "session", requestID: "question" } } })
+    await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+    finishInspection({ data: [] })
+    await queued
+
+    assert.equal(await list(current), "1. retry after error")
+    assert.equal(replays, 0)
+    await chat(current, "start", "/queue:start")
+    assert.equal(await replayed, "retry after error")
+    assert.equal(await list(current), "Queue is empty")
+  })
+}
+
+for (const type of ["session.idle", "session.status"]) {
+  isolated(`dismissed questions block replay on ${type} until queue start`, async () => {
+    const replayed = []
+    const started = deferred()
+    const current = await plugin({ prompt: async ({ body }) => {
+      replayed.push(body.parts[0].text)
+      started.resolve()
+    } })
+    await busy(current)
+    await chat(current, "queued", "/queue wait for resume")
+    await current.event({ event: { type: "question.rejected", properties: { sessionID: "session", requestID: "question" } } })
+    // OpenCode can emit more busy/retry events without starting a new run.
+    await busy(current)
+    await current.event({ event: { type: "session.status", properties: { sessionID: "session", status: { type: "retry", attempt: 1, message: "retrying", next: 0 } } } })
+    await current.event({ event: { type, properties: { sessionID: "session", status: { type: "idle" } } } })
+    await idleEvent(current)
+    assert.equal(await list(current), "1. wait for resume")
+    assert.deepEqual(replayed, [])
+
+    await control(current, "queue:start")
+    await started.promise
+    assert.deepEqual(replayed, ["wait for resume"])
+    assert.equal(await list(current), "Queue is empty")
+  })
+}
+
+isolated("a dismissed question during replay keeps the next item queued after the request succeeds", async () => {
+  const started = deferred()
+  const finished = deferred()
+  const replayed = []
+  const current = await plugin({ prompt: async ({ body }) => {
+    replayed.push(body.parts[0].text)
+    started.resolve()
+    await finished.promise
+  } })
+  await busy(current)
+  await chat(current, "first", "/queue first")
+  const flushing = control(current, "queue:flush")
+  await started.promise
+  await chat(current, "second", "/queue second")
+  await current.event({ event: { type: "question.rejected", properties: { sessionID: "session", requestID: "question" } } })
+  await busy(current)
+  await idleEvent(current)
+  finished.resolve()
+  await flushing
+  assert.equal(await list(current), "1. second")
+  assert.deepEqual(replayed, ["first"])
+  assert.equal(await list(await plugin()), "1. second")
+})
+
+for (const type of ["question.replied", "question.rejected"]) {
+  isolated(`replays after ${type === "question.replied" ? "answering a question" : "a new run finishes after dismissing a question"}`, async () => {
+    const started = deferred()
+    const current = await plugin({ prompt: async ({ body }) => started.resolve(body.parts[0].text) })
+    await busy(current)
+    await chat(current, "queued", "/queue continue")
+    await current.event({ event: { type, properties: { sessionID: "session", requestID: "question", answers: [["No"]] } } })
+    if (type === "question.rejected") {
+      await idleEvent(current)
+      assert.equal(await list(current), "1. continue")
+      await busy(current)
+    }
+    await idle(current)
+    assert.equal(await started.promise, "continue")
+    assert.equal(await list(current), "Queue is empty")
+  })
+}
+
+for (const type of ["session.idle", "session.status"]) {
+  isolated(`bare ${type} never advances prompts or carry boundaries`, async () => {
+    const current = await plugin({
+      prompt: () => assert.fail("an idle event is not completion evidence"),
+      create: () => assert.fail("an idle event must not carry the queue"),
+    })
+    await busy(current)
+    await chat(current, "queued", "/queue wait")
+    await control(current, "queue:carry-front")
+    await current.event({ event: { type, properties: { sessionID: "session", status: { type: "idle" } } } })
+    await idleEvent(current)
+    assert.equal(await list(current), "1. --- carry: new session 1 ---\n2. wait")
+  })
+}
+
+for (const reason of [undefined, "tool-calls", "unknown", "length", "content-filter", "error", "other"]) {
+  isolated(`a completed assistant with finish ${reason} does not advance the queue`, async () => {
+    const current = await plugin({ prompt: () => assert.fail("only a natural finish may replay") })
+    await busy(current)
+    await chat(current, "queued", "/queue wait")
+    await update(current, assistant({ finish: reason }))
+    await idleEvent(current)
+    assert.equal(await list(current), "1. wait")
+  })
+}
+
+isolated("a stop finish without a completed timestamp does not advance the queue", async () => {
+  const current = await plugin({ prompt: () => assert.fail("streaming is not completion") })
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  await update(current, assistant({ time: { created: ++messageClock } }))
+  await idleEvent(current)
+  assert.equal(await list(current), "1. wait")
+})
+
+for (const name of ["MessageAbortedError", "UnknownError"]) {
+  isolated(`${name} on the assistant blocks replay without session.error`, async () => {
+    const current = await plugin({ prompt: () => assert.fail("an assistant error must pause replay") })
+    await busy(current)
+    await chat(current, "queued", "/queue wait")
+    await update(current, assistant({ error: { name, data: { message: "interrupted" } } }))
+    await busy(current)
+    await finish(current)
+    await idleEvent(current)
+    assert.equal(await list(current), "1. wait")
+  })
+}
+
+for (const reply of ["reject", "once", "always"]) {
+  isolated(`permission ${reply} ${reply === "reject" ? "blocks" : "allows"} replay`, async () => {
+    const replayed = []
+    const started = deferred()
+    const current = await plugin({ prompt: async () => { replayed.push("sent"); started.resolve() } })
+    await busy(current)
+    await chat(current, "queued", "/queue wait")
+    await current.event({ event: { type: "permission.replied", properties: { sessionID: "session", requestID: "permission", reply } } })
+    await busy(current)
+    await idle(current)
+    if (reply === "reject") {
+      assert.equal(await list(current), "1. wait")
+      assert.deepEqual(replayed, [])
+    } else {
+      await started.promise
+      assert.equal(await list(current), "Queue is empty")
+      assert.deepEqual(replayed, ["sent"])
+    }
+  })
+}
+
+isolated("an interrupted tool blocks replay even if the model subsequently finishes", async () => {
+  const submitted = []
+  const current = await plugin({ prompt: async () => submitted.push("sent") })
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  const info = assistant({ time: { created: ++messageClock } })
+  await update(current, info)
+  await updatePart(current, { type: "tool", sessionID: "session", messageID: info.id, state: { status: "error", metadata: { interrupted: true } } })
+  await busy(current)
+  await idle(current)
+  assert.equal(await list(current), "1. wait")
+  assert.deepEqual(submitted, [])
+})
+
+isolated("a stop-labelled tool step is not a terminal model response", async () => {
+  const current = await plugin({ prompt: () => assert.fail("tool steps cannot release queued work") })
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  const info = assistant({ time: { created: ++messageClock } })
+  await update(current, info)
+  await updatePart(current, { type: "tool", sessionID: "session", messageID: info.id, tool: "question", state: { status: "completed", output: "answered" } })
+  await update(current, { ...info, time: { ...info.time, completed: ++messageClock } })
+  await idleEvent(current)
+  assert.equal(await list(current), "1. wait")
+})
+
+isolated("a stale final response cannot complete a new run", async () => {
+  const started = deferred()
+  const current = await plugin({ prompt: async () => started.resolve() })
+  await busy(current)
+  const previous = assistant()
+  await update(current, previous)
+  await idleEvent(current)
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  await update(current, previous)
+  await idleEvent(current)
+  assert.equal(await list(current), "1. wait")
+  await busy(current)
+  await idle(current)
+  await started.promise
+  assert.equal(await list(current), "Queue is empty")
+})
+
+for (const kind of ["assistant", "tool"]) {
+  for (const assistantStarted of [false, true]) {
+    isolated(`late ${kind} cleanup from an earlier run is ignored ${assistantStarted ? "after" : "before"} the next assistant starts`, async () => {
+      const sent = deferred()
+      const current = await plugin({ prompt: async () => sent.resolve() })
+      await busy(current)
+      const previous = assistant({ time: { created: ++messageClock } })
+      await update(current, previous)
+      await chat(current, "queued", "/queue wait")
+      await current.event({ event: { type: "session.error", properties: { sessionID: "session" } } })
+      await idleEvent(current)
+      assert.equal(await list(current), "1. wait")
+      await busy(current)
+      await update(current, { id: "steering", sessionID: "session", role: "user", time: { created: ++messageClock } })
+      const next = assistant({ parentID: "steering", time: { created: ++messageClock } })
+      if (assistantStarted) await update(current, next)
+      if (kind === "assistant") {
+        await update(current, { ...previous, error: { name: "MessageAbortedError", data: { message: "interrupted" } } })
+      } else {
+        await updatePart(current, { type: "tool", sessionID: "session", messageID: previous.id, state: { status: "error", metadata: { interrupted: true } } })
+      }
+      await update(current, { ...next, time: { ...next.time, completed: ++messageClock } })
+      await idleEvent(current)
+      await sent.promise
+      assert.equal(await list(current), "Queue is empty")
+    })
+  }
+
+  isolated(`steering input does not hide an active assistant's ${kind} interruption`, async () => {
+    const submitted = []
+    const current = await plugin({ prompt: async () => submitted.push("sent") })
+    await busy(current)
+    const active = assistant({ time: { created: ++messageClock } })
+    await update(current, active)
+    await chat(current, "queued", "/queue wait")
+    await update(current, { id: "steering", sessionID: "session", role: "user", time: { created: ++messageClock } })
+    if (kind === "assistant") {
+      await update(current, { ...active, error: { name: "MessageAbortedError", data: { message: "interrupted" } } })
+    } else {
+      await updatePart(current, { type: "tool", sessionID: "session", messageID: active.id, state: { status: "error", metadata: { interrupted: true } } })
+    }
+    await update(current, assistant({ parentID: "steering" }))
+    await idleEvent(current)
+    assert.equal(await list(current), "1. wait")
+    assert.deepEqual(submitted, [])
+  })
+}
+
+isolated("a newer incomplete assistant supersedes an older natural finish", async () => {
+  const current = await plugin({ prompt: () => assert.fail("the latest assistant must complete") })
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  const previous = assistant()
+  await update(current, previous)
+  await update(current, assistant({ finish: undefined, time: { created: ++messageClock } }))
+  await update(current, previous)
+  await idleEvent(current)
+  assert.equal(await list(current), "1. wait")
+})
+
+isolated("steering input requires a response to the latest real user message", async () => {
+  const started = deferred()
+  const current = await plugin({ prompt: async () => started.resolve() })
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  await update(current, { id: "steering", sessionID: "session", role: "user", time: { created: ++messageClock } })
+  await update(current, assistant({ parentID: "previous-user" }))
+  await idleEvent(current)
+  assert.equal(await list(current), "1. wait")
+  await busy(current)
+  await update(current, assistant({ parentID: "steering" }))
+  await idleEvent(current)
+  await started.promise
+  assert.equal(await list(current), "Queue is empty")
+})
+
+for (const toolFirst of [false, true]) {
+  isolated(`structured output can continue when its terminal tool arrives ${toolFirst ? "first" : "last"}`, async () => {
+    const started = deferred()
+    const current = await plugin({ prompt: async () => started.resolve() })
+    await busy(current)
+    await chat(current, "queued", "/queue continue")
+    const info = assistant({ finish: "tool-calls" })
+    await update(current, info)
+    const tool = { type: "tool", sessionID: "session", messageID: info.id, tool: "StructuredOutput", state: { status: "completed", output: "result" } }
+    if (toolFirst) await updatePart(current, tool)
+    await update(current, { ...info, structured: { result: true } })
+    if (!toolFirst) await updatePart(current, tool)
+    await idleEvent(current)
+    await started.promise
+    assert.equal(await list(current), "Queue is empty")
+  })
+}
+
+for (const [aborted, toolFirst] of [[false, false], [false, true], [true, false], [true, true]]) {
+  isolated(`a native shell ${aborted ? "abort blocks" : "completion allows"} replay with its tool ${toolFirst ? "first" : "last"}`, async () => {
+    const started = deferred()
+    const replayed = []
+    const current = await plugin({ prompt: async () => { replayed.push("sent"); started.resolve() } })
+    await busy(current)
+    await chat(current, "queued", "/queue wait")
+    await update(current, { id: "shell-user", sessionID: "session", role: "user", time: { created: ++messageClock } })
+    await updatePart(current, { type: "text", sessionID: "session", messageID: "shell-user", synthetic: true, text: "The following tool was executed by the user" })
+    const info = assistant({ parentID: "shell-user", finish: undefined, time: { created: ++messageClock } })
+    await update(current, info)
+    const tool = { type: "tool", sessionID: "session", messageID: info.id, tool: "bash", state: { status: "completed", output: aborted ? "done\n\n<metadata>\nUser aborted the command\n</metadata>" : "User aborted the command" } }
+    if (toolFirst) await updatePart(current, tool)
+    await update(current, { ...info, time: { ...info.time, completed: ++messageClock } })
+    if (!toolFirst) await updatePart(current, tool)
+    await idleEvent(current)
+    if (aborted) {
+      assert.equal(await list(current), "1. wait")
+      assert.deepEqual(replayed, [])
+    } else {
+      await started.promise
+      assert.equal(await list(current), "Queue is empty")
+      assert.deepEqual(replayed, ["sent"])
+    }
+  })
+}
+
+isolated("explicit resume during an interrupted run preserves its completed response", async () => {
+  const sent = deferred()
+  const current = await plugin({ prompt: async () => sent.resolve() })
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  await current.event({ event: { type: "question.rejected", properties: { sessionID: "session", requestID: "question" } } })
+  await finish(current)
+  await control(current, "queue:start")
+  assert.equal(await list(current), "1. wait")
+  await idleEvent(current)
+  await sent.promise
+  assert.equal(await list(current), "Queue is empty")
+})
+
+isolated("a failed error notification is reported without stranding a failed replay", async (_, t) => {
+  const current = await plugin({ prompt: async () => { throw new Error("send failed") } })
+  await busy(current)
+  await chat(current, "queued", "/queue wait")
+  const warnings = []
+  const error = new Error("notification failed")
+  t.mock.method(console, "warn", (...args) => warnings.push(args))
+  const showToast = current.client.tui.showToast
+  t.mock.method(current.client.tui, "showToast", async (input) => {
+    if (input.body.message.startsWith("Queue failed:")) throw error
+    return showToast(input)
+  })
+  assert.equal(await control(current, "queue:flush"), "Flushed 0 queued items; 1 failed")
+  assert.equal(await list(current), "1. wait")
+  assert.equal(await list(await plugin()), "1. wait")
+  assert.deepEqual(warnings, [["QueuePlugin failed to display a notification", error]])
+})
+
+for (const scenario of [
+  { input: "wait", api: "prompt" },
+  { input: "!pwd", api: "shell" },
+  { input: "/compact", api: "summarize" },
+  { input: "/review changes", api: "command" },
+  { input: "/review changes", api: "command", lookup: true },
+  { input: "/missing changes", api: "prompt", lookup: true },
+  { input: "wait", api: "prompt", pause: true },
+  { input: "wait", api: "prompt", idleOnly: true },
+  { input: "wait", api: "prompt", manual: true },
+  { input: "/review changes", api: "command", lookup: true, manual: true },
+  { input: "wait", api: "prompt", manual: true, idleOnly: true },
+]) {
+  isolated(`a stop during ${scenario.lookup ? "command" : "session"} lookup retains ${scenario.input}${scenario.manual ? " during manual flush" : ""}${scenario.pause ? " after stop/start" : scenario.idleOnly ? " with only an idle status" : ""}`, async (_, t) => {
+    const checking = deferred()
+    const checked = deferred()
+    const current = await plugin({
+      ...(scenario.lookup ? {} : { get: () => { checking.resolve(); return checked.promise } }),
+      [scenario.api]: () => assert.fail("interrupted dispatch must not submit"),
+    }, { command: scenario.lookup ? { list: () => { checking.resolve(); return checked.promise } } : {} })
+    await busy(current)
+    await chat(current, "queued", `/queue ${scenario.input}`)
+    const flushing = scenario.manual ? control(current, "queue:flush") : undefined
+    if (!scenario.manual) await idle(current)
+    await checking.promise
+    if (scenario.pause) {
+      await control(current, "queue:stop")
+      await control(current, "queue:start")
+    } else if (scenario.idleOnly) {
+      await current.event({ event: { type: "session.status", properties: { sessionID: "session", status: { type: "idle" } } } })
+    } else {
+      await current.event({ event: { type: "question.rejected", properties: { sessionID: "session", requestID: "question" } } })
+    }
+    const written = deferred()
+    const rename = fs.rename
+    t.mock.method(fs, "rename", async (...args) => {
+      await rename(...args)
+      written.resolve()
+    }, { times: 1 })
+    checked.resolve({ data: scenario.lookup ? [{ name: "review" }] : { directory: "/project" } })
+    if (flushing) assert.equal(await flushing, "Flushed 0 queued items; 1 deferred")
+    await written.promise
+    assert.equal(await list(current), `1. ${scenario.input}`)
+    assert.equal(await list(await plugin()), `1. ${scenario.input}`)
+  })
+}
+
+isolated("a stop control blocks delayed input before its ordered persistence finishes", async () => {
+  const inspecting = deferred()
+  const inspected = deferred()
   const current = await plugin({
-    messages: () => inspection,
-    prompt: async ({ body }) => {
-      replays++
-      finishReplay(body.parts[0].text)
-    },
+    messages: () => { inspecting.resolve(); return inspected.promise },
+    prompt: () => assert.fail("queue stop must take effect before input finishes"),
   })
   await busy(current)
+  const queued = chat(current, "queued", "/queue wait")
+  await inspecting.promise
+  const stopping = control(current, "queue:stop")
+  await idle(current)
+  inspected.resolve({ data: [] })
+  await Promise.all([queued, stopping])
+  assert.equal(await list(current), "1. wait\nQueue is stopped")
+})
 
-  const queued = chat(current, "queued", "/queue retry after error")
-  await current.event({ event: { type: "session.error", properties: { sessionID: "session" } } })
-  await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
-  finishInspection({ data: [] })
-  await queued
+for (const command of ["queue:start", "queue:flush"]) {
+  for (const path of ["command", "chat"]) {
+    isolated(`a delayed ${command} from ${path} cannot override a later stop`, async () => {
+      const inspecting = deferred()
+      const inspected = deferred()
+      const current = await plugin({
+        messages: () => { inspecting.resolve(); return inspected.promise },
+        prompt: () => assert.fail("an older resume must not override a newer stop"),
+      })
+      await busy(current)
+      const pending = chat(current, "queued", "/queue wait")
+      await inspecting.promise
+      const resuming = path === "command" ? control(current, command) : chat(current, "resume", `/${command}`)
+      const stopping = control(current, "queue:stop")
+      await idle(current)
+      inspected.resolve({ data: [] })
+      await Promise.all([pending, resuming, stopping])
+      assert.equal(await list(current), "1. wait\nQueue is stopped")
+      assert.ok(current.toasts.some((message) => message.includes("deferred because the session was interrupted")))
+      assert.equal(await list(await plugin()), "1. wait\nQueue is stopped")
+    })
+  }
+}
 
-  assert.equal(await list(current), "1. retry after error")
-  assert.equal(replays, 0)
-  await chat(current, "start", "/queue:start")
-  assert.equal(await replayed, "retry after error")
+isolated("permission rejection cancels an automatic carry already creating a session", async () => {
+  const creating = deferred()
+  const created = deferred()
+  const removed = deferred()
+  const current = await plugin({
+    create: () => { creating.resolve(); return created.promise },
+    delete: async ({ path }) => removed.resolve(path.id),
+  })
+  await busy(current)
+  await control(current, "queue:carry")
+  await chat(current, "queued", "/queue wait")
+  await idle(current)
+  await creating.promise
+  await current.event({ event: { type: "permission.replied", properties: { sessionID: "session", requestID: "permission", reply: "reject" } } })
+  await busy(current)
+  await idle(current)
+  created.resolve({ data: { id: "unused" } })
+  assert.equal(await removed.promise, "unused")
+  assert.deepEqual(current.selected, [])
+  assert.equal(await list(current), "1. --- carry: new session 1 ---\n2. wait")
+})
+
+for (const type of ["question.rejected", "session.status"]) isolated(`a ${type} stop during carry selection keeps destination work queued`, async () => {
+  const selecting = deferred()
+  const selected = deferred()
+  const current = await plugin({
+    create: async () => ({ data: { id: "next" } }),
+    prompt: () => assert.fail("carry selection must not release work after an interruption"),
+  }, { request: () => { selecting.resolve(); return selected.promise } })
+  await busy(current)
+  await control(current, "queue:carry")
+  await chat(current, "queued", "/queue wait")
+  const flushing = control(current, "queue:flush")
+  await selecting.promise
+  assert.equal(await list(current, "next"), "1. wait")
+  await current.event({ event: { type, properties: { sessionID: "session", requestID: "question", status: { type: "idle" } } } })
+  selected.resolve({ response: new Response() })
+  await flushing
+  assert.equal(await list(current, "next"), "1. wait")
+  assert.equal(await list(await plugin(), "next"), "1. wait")
+})
+
+isolated("paired natural idle notifications do not cancel a reserved replay", async () => {
+  const checking = deferred()
+  const checked = deferred()
+  const sent = deferred()
+  const current = await plugin({
+    get: () => { checking.resolve(); return checked.promise },
+    prompt: async () => sent.resolve(),
+  })
+  await busy(current)
+  await chat(current, "queued", "/queue continue")
+  await finish(current)
+  await current.event({ event: { type: "session.status", properties: { sessionID: "session", status: { type: "idle" } } } })
+  await checking.promise
+  await idleEvent(current)
+  checked.resolve({ data: { directory: "/project" } })
+  await sent.promise
+  assert.equal(await list(current), "Queue is empty")
+})
+
+isolated("a natural finish during manual flush lookup does not cancel the flush", async () => {
+  const checking = deferred()
+  const checked = deferred()
+  let sent = 0
+  const current = await plugin({
+    get: () => { checking.resolve(); return checked.promise },
+    prompt: async () => { sent++ },
+  })
+  await busy(current)
+  await chat(current, "queued", "/queue continue")
+  const flushing = control(current, "queue:flush")
+  await checking.promise
+  await finish(current)
+  await current.event({ event: { type: "session.status", properties: { sessionID: "session", status: { type: "idle" } } } })
+  await idleEvent(current)
+  checked.resolve({ data: { directory: "/project" } })
+  assert.equal(await flushing, "Flushed 1 queued item")
+  assert.equal(sent, 1)
+  assert.equal(await list(current), "Queue is empty")
+})
+
+for (const completeBefore of [false, true]) {
+  isolated(`a new run during replay lookup can finish ${completeBefore ? "before" : "after"} the reserved item is deferred`, async (_, t) => {
+    const checking = deferred()
+    const checked = deferred()
+    const sent = deferred()
+    const current = await plugin({ prompt: async ({ body }) => sent.resolve(body.parts[0].text) })
+    const get = current.client.session.get
+    t.mock.method(current.client.session, "get", async (...args) => {
+      checking.resolve()
+      await checked.promise
+      return get(...args)
+    }, { times: 1 })
+    await busy(current)
+    await chat(current, "queued", "/queue wait")
+    await idle(current)
+    await checking.promise
+    await update(current, { id: "steering", sessionID: "session", role: "user", time: { created: ++messageClock } })
+    await busy(current)
+    const next = assistant({ parentID: "steering", time: { created: ++messageClock } })
+    await update(current, next)
+    const complete = async () => {
+      await update(current, { ...next, time: { ...next.time, completed: ++messageClock } })
+      await idleEvent(current)
+    }
+    if (completeBefore) await complete()
+    const written = deferred()
+    const rename = fs.rename
+    t.mock.method(fs, "rename", async (...args) => {
+      await rename(...args)
+      written.resolve()
+    }, { times: 1 })
+    checked.resolve()
+    await written.promise
+    if (!completeBefore) {
+      assert.equal(await list(current), "1. wait")
+      await complete()
+    }
+    assert.equal(await sent.promise, "wait")
+    assert.equal(await list(current), "Queue is empty")
+  })
+}
+
+isolated("a stop during carry persistence rolls back the transfer before publishing it", async (_, t) => {
+  const removed = []
+  const current = await plugin({
+    create: async () => ({ data: { id: "unused" } }),
+    delete: async ({ path }) => removed.push(path.id),
+    prompt: () => assert.fail("a cancelled transfer must not start destination work"),
+  })
+  await busy(current)
+  await control(current, "queue:carry")
+  await chat(current, "queued", "/queue wait")
+  const writing = deferred()
+  const written = deferred()
+  const original = fs.writeFile
+  t.mock.method(fs, "writeFile", async (...args) => {
+    writing.resolve()
+    await written.promise
+    return original(...args)
+  }, { times: 1 })
+  try {
+    const flushing = control(current, "queue:flush")
+    await writing.promise
+    await current.event({ event: { type: "question.rejected", properties: { sessionID: "session", requestID: "question" } } })
+    written.resolve()
+    assert.equal(await flushing, "Carry deferred because the queue or session changed")
+    assert.deepEqual(removed, ["unused"])
+    assert.deepEqual(current.selected, [])
+    const expected = "1. --- carry: new session 1 ---\n2. wait"
+    assert.equal(await list(current), expected)
+    const restored = await plugin()
+    assert.equal(await list(restored), expected)
+    assert.equal(await list(restored, "unused"), "Queue is empty")
+  } finally {
+    written.resolve()
+  }
+})
+
+isolated("deleting the carry destination during selection does not release work", async () => {
+  const selecting = deferred()
+  const selected = deferred()
+  const current = await plugin({
+    create: async () => ({ data: { id: "next" } }),
+    prompt: () => assert.fail("a deleted destination must not receive queued work"),
+  }, { request: () => { selecting.resolve(); return selected.promise } })
+  await busy(current)
+  await control(current, "queue:carry")
+  await chat(current, "queued", "/queue wait")
+  const flushing = control(current, "queue:flush")
+  await selecting.promise
+  await current.event({ event: { type: "session.deleted", properties: { info: { id: "next" } } } })
+  selected.resolve({ response: new Response() })
+  await flushing
+  assert.equal(await list(await plugin(), "next"), "Queue is empty")
 })
 
 isolated("does not recreate a deleted session from pending input", async () => {
@@ -859,7 +1475,7 @@ isolated("flush steers all remaining messages while an automatic replay is still
   await chat(current, "first", "/queue first")
   await chat(current, "second", "/queue second")
   await chat(current, "third", "/queue third")
-  await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+  await idle(current)
   await requests[0].started.promise
   await busy(current)
 
@@ -901,7 +1517,7 @@ for (const [order, busyAgain] of [[[0, 1], false], [[1, 0], false], [[0, 1], tru
     await chat(current, "second", "/queue second")
     const second = chat(current, "flush-second", "/queue:flush")
     await requests[1].started.promise
-    await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+    await idle(current)
     if (busyAgain) await busy(current)
     await chat(current, "third", "/queue third")
     assert.equal(await list(current), "1. third")
@@ -918,7 +1534,7 @@ for (const [order, busyAgain] of [[[0, 1], false], [[1, 0], false], [[0, 1], tru
 
     if (busyAgain) {
       assert.equal(await list(current), "1. third")
-      await current.event({ event: { type: "session.idle", properties: { sessionID: "session" } } })
+      await idle(current)
     }
     await requests[2].started.promise
     assert.deepEqual(replayed, ["first", "second", "third"])

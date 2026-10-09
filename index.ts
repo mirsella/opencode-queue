@@ -1,8 +1,9 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AgentPartInput, FilePart, FilePartInput, SessionCommandData, SubtaskPartInput, TextPart, TextPartInput } from "@opencode-ai/sdk"
+import type { AssistantMessage, Event } from "@opencode-ai/sdk/v2"
 import { HttpServerResponse } from "effect/unstable/http"
 import { createHash, randomUUID } from "node:crypto"
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import fs from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -17,7 +18,6 @@ type Model = { providerID: string; modelID: string }
 type Run = { agent: string; model?: Model }
 type Info = { agent: string; model: Model; variant?: string }
 type Msg = { info: { role: string; agent?: string; mode?: string; model?: Model; providerID?: string; modelID?: string; variant?: string } }
-type Ask = { type: string; properties: { id: string; sessionID: string; questions: { question: string; header: string }[] } }
 type Post = (input: { url: string; path?: Record<string, string>; body?: unknown; headers?: Record<string, string> }) => Promise<{ response?: Response; error?: unknown } | undefined>
 const COMMANDS = {
   q: "Queue input or show the current queue",
@@ -62,12 +62,19 @@ type ControlOp =
   | { kind: "always"; enabled?: boolean }
 
 type Activity = { readonly kind: "idle" | "restored" } | { readonly kind: "busy"; readonly directory: string }
-type Carrying = { kind: "carrying"; item: Extract<Item, { kind: "carry" }>; automatic: boolean }
-type Sending = { kind: "sending"; batches: { items: ReplayItem[]; pending: boolean }[] }
-type State = { items: readonly Item[]; activity: Activity; flight?: Carrying | Sending; stopped: boolean; failed: boolean; hidden: Set<string> }
+type MessageStamp = { id: string; created: number }
+type Completion = MessageStamp & { parentID: string; completed?: number; result: "pending" | "tools" | "model" | "structured" | "shell" }
+type Carrying = { kind: "carrying"; item: Extract<Item, { kind: "carry" }>; automatic: boolean; generation: number }
+type Batch = { items: ReplayItem[]; phase: "reserved" | "sending" | "settled"; generation: number; interruption: number }
+type Sending = { kind: "sending"; batches: Batch[] }
+type State = {
+  items: readonly Item[]; activity: Activity; flight?: Carrying | Sending; stopped: boolean; hidden: Set<string>
+  gate: "waiting" | "ready" | "interrupted"; generation: number; interruption: number; last?: Completion; boundary?: string; user?: MessageStamp & { shell?: true }
+}
 type Draft = Pick<State, "items" | "stopped" | "hidden">
 type Store = { version: 1; projectID: string; sessions: Record<string, { items: readonly Item[]; stopped: boolean; hidden: string[] }> }
 type Placeholder = { id: string; part: TextPart }
+type Flush = { kind: "next" } | { kind: "all"; interruption: number; placeholder?: Placeholder }
 type Target = { path: { id: string }; query: { directory: string } }
 
 // OpenCode creates a plugin instance per directory, even for the same project.
@@ -173,8 +180,8 @@ const control = (op: Op): op is ControlOp => {
 const shouldQueue = (state?: State) => Boolean(state && (state.flight || state.activity.kind !== "idle" || state.stopped || state.items.length))
 const sendNow = (state: State | undefined, command: QueueCommand, op: EntryOp) =>
   op.kind !== "carry" && ((command === "queue:now" && op.kind !== "shell") || !shouldQueue(state))
-const canAdvance = (state: State) => !state.flight && state.activity.kind === "idle" && !state.stopped && !state.failed && state.items.length > 0
-const shouldDeclinePlan = (state?: State) => Boolean(state && (state.flight?.kind === "sending" || (!state.stopped && state.items.length)))
+const canAdvance = (state: State) => !state.flight && state.activity.kind === "idle" && state.gate === "ready" && !state.stopped && state.items.length > 0
+const shouldDeclinePlan = (state?: State) => Boolean(state && state.gate !== "interrupted" && (state.flight?.kind === "sending" || (!state.stopped && state.items.length)))
 const itemText = (item: Item) => {
   if (item.kind === "carry") return "carry: new session"
   if (item.kind !== "prompt") return item.source
@@ -192,13 +199,42 @@ const describeQueue = (state?: Pick<State, "items" | "stopped">) => {
 const handled = (): never => {
   throw HttpServerResponse.empty({ status: 204 })
 }
-const plan = (event: unknown): event is Ask => {
-  if (typeof event !== "object" || !event || !("type" in event) || event.type !== "question.asked") return false
-  const question = (event as Ask).properties?.questions?.[0]
-  return question?.header === "Build Agent" && question.question.includes("switch to the build agent")
-}
-
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
+const older = (message: Pick<AssistantMessage, "id" | "time">, previous?: MessageStamp) =>
+  Boolean(previous && (message.time.created < previous.created || (message.time.created === previous.created && message.id < previous.id)))
+const interrupt = (current: State) => {
+  current.gate = "interrupted"
+  current.generation++
+  current.interruption++
+}
+const begin = (current: State) => {
+  if (current.gate !== "interrupted") current.gate = "waiting"
+  if (current.activity.kind !== "busy") current.boundary = current.last?.id
+  current.generation++
+}
+const completionGate = (current: State): "ready" | "waiting" => {
+  const last = current.last
+  return last && last.id !== current.boundary && last.completed !== undefined && last.result !== "pending" && last.result !== "tools" && (!current.user || last.parentID === current.user.id) ? "ready" : "waiting"
+}
+const refreshGate = (current: State) => {
+  if (current.gate !== "interrupted") current.gate = completionGate(current)
+}
+const observe = (current: State, info: AssistantMessage) => {
+  if (info.id === current.boundary || older(info, current.last)) return
+  if (info.error) interrupt(current)
+  if (current.activity.kind !== "busy" && current.flight?.kind !== "sending") return
+  const previous = current.last?.id === info.id ? current.last : undefined
+  if (!previous && current.flight?.kind === "sending") current.generation++
+  let result: Completion["result"] = "pending"
+  if (info.structured !== undefined) result = "structured"
+  else if (previous?.result === "shell" || previous?.result === "tools") result = previous.result
+  else if (info.finish === "stop") result = "model"
+  current.last = {
+    id: info.id, created: info.time.created, parentID: info.parentID, result,
+    completed: info.error ? undefined : info.time.completed,
+  }
+  refreshGate(current)
+}
 const validInfo = (value: unknown): value is Info =>
   record(value) &&
   typeof value.agent === "string" &&
@@ -247,13 +283,13 @@ const dataHome = () => {
 }
 
 const writeJson = async (path: string, value: unknown) => {
-  await mkdir(dirname(path), { recursive: true })
+  await fs.mkdir(dirname(path), { recursive: true })
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
   try {
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-    await rename(temporary, path)
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+    await fs.rename(temporary, path)
   } finally {
-    await rm(temporary, { force: true }).catch((error) => console.warn("QueuePlugin failed to remove temporary storage", error))
+    await fs.rm(temporary, { force: true }).catch((error) => console.warn("QueuePlugin failed to remove temporary storage", error))
   }
 }
 
@@ -274,7 +310,7 @@ const alwaysSetting = (path: string) => {
     scope: "globally",
     get: async () => {
       try {
-        const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
+        const parsed: unknown = JSON.parse(await fs.readFile(path, "utf8"))
         if (record(parsed) && typeof parsed.always === "boolean") return parsed.always
         console.warn("QueuePlugin ignored invalid global settings", path)
       } catch (error) {
@@ -295,7 +331,7 @@ const openQueues = (key: string, path: string, projectID: string) => {
   let writes = Promise.resolve()
   const ready = (async () => {
     try {
-      const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
+      const parsed: unknown = JSON.parse(await fs.readFile(path, "utf8"))
       if (!record(parsed) || parsed.version !== 1 || parsed.projectID !== projectID || !record(parsed.sessions)) {
         console.warn("QueuePlugin ignored invalid queue storage", path)
         return
@@ -311,7 +347,7 @@ const openQueues = (key: string, path: string, projectID: string) => {
         if (!validHidden) console.warn("QueuePlugin skipped invalid stored hidden messages", sid)
         const hidden = new Set(validHidden ? (value.hidden as string[]) : [])
         const activity: Activity = { kind: items.length && !value.stopped ? "restored" : "idle" }
-        if (items.length || value.stopped || hidden.size) sessions.set(sid, { items, activity, stopped: value.stopped, failed: false, hidden })
+        if (items.length || value.stopped || hidden.size) sessions.set(sid, { items, activity, stopped: value.stopped, hidden, gate: "waiting", generation: 0, interruption: 0 })
       }
     } catch (error) {
       if (!record(error) || error.code !== "ENOENT") console.error("QueuePlugin failed to load queue storage", error)
@@ -331,18 +367,29 @@ const openQueues = (key: string, path: string, projectID: string) => {
     if (pending === writes && unused() && runtimes.get(key) === queues) runtimes.delete(key)
   }
 
-  // Call inside serialize: publish drafts in memory only after the atomic disk write.
-  const commit = async (...updates: [State, Draft][]) => {
-    const drafts = new Map(updates)
+  const snapshot = (drafts?: ReadonlyMap<State, Draft>): Store => {
     const stored: Store = { version: 1, projectID, sessions: {} }
     for (const [id, current] of sessions) {
       if (deleted.has(id)) continue
-      const durable = drafts.get(current) ?? current
+      const durable = drafts?.get(current) ?? current
       const items = current.flight?.kind === "sending" ? current.flight.batches.flatMap<Item>((batch) => batch.items).concat(durable.items) : durable.items
       if (items.length || durable.stopped || durable.hidden.size) stored.sessions[id] = { items, stopped: durable.stopped, hidden: [...durable.hidden] }
     }
-    await writeJson(path, stored)
+    return stored
+  }
+
+  // Call inside serialize: publish drafts in memory only after the atomic disk write.
+  const commit = async (updates: [State, Draft][] = [], eligible?: () => boolean) => {
+    const drafts = new Map(updates)
+    await writeJson(path, snapshot(drafts))
+    if (eligible && !eligible()) {
+      // An interruption can arrive during disk I/O. Restore the original queues
+      // before exposing a cancelled transfer in memory.
+      await writeJson(path, snapshot())
+      return false
+    }
     for (const [current, draft] of updates) Object.assign(current, draft)
+    return true
   }
 
   const serialize = <T>(action: () => Promise<T>) => {
@@ -355,7 +402,7 @@ const openQueues = (key: string, path: string, projectID: string) => {
   const state = (sid: string) => {
     let current = sessions.get(sid)
     if (!current) {
-      current = { items: [], activity: { kind: "idle" }, stopped: false, failed: false, hidden: new Set() }
+      current = { items: [], activity: { kind: "idle" }, stopped: false, hidden: new Set(), gate: "ready", generation: 0, interruption: 0 }
       sessions.set(sid, current)
     }
     return current
@@ -368,7 +415,7 @@ const openQueues = (key: string, path: string, projectID: string) => {
       const draft: Draft = { items: current.items, stopped: current.stopped, hidden: current.hidden }
       const value = mutate(draft)
       if (placeholder && !current.hidden.has(placeholder.id)) draft.hidden = new Set(current.hidden).add(placeholder.id)
-      if (draft.items !== current.items || draft.stopped !== current.stopped || draft.hidden !== current.hidden) await commit([current, draft])
+      if (draft.items !== current.items || draft.stopped !== current.stopped || draft.hidden !== current.hidden) await commit([[current, draft]])
       if (placeholder) Object.assign(placeholder.part, { text: "", synthetic: true, ignored: true })
       return value
     })
@@ -416,7 +463,8 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
   const automaticallyQueue = async (sid: string) => shouldQueue(sessions.get(sid)) && (await always.get())
 
   const toast = (message: string, variant: "info" | "error", duration = 2500) =>
-    client.tui.showToast({ body: { message, variant, duration }, query: { directory } }).catch(() => undefined)
+    client.tui.showToast({ body: { message, variant, duration }, query: { directory } })
+      .catch((error) => console.warn("QueuePlugin failed to display a notification", error))
 
   const stop = async (message: string, variant: "info" | "error" = "info", duration = 5000): Promise<never> => {
     await toast(message, variant, duration)
@@ -530,7 +578,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
     return client.session.prompt({ ...target, body: { ...opts(info), parts: clone }, throwOnError: true })
   }
 
-  const replay = async (sid: string, items: ReplayItem[]) => {
+  const replay = async (sid: string, items: ReplayItem[], authorize: () => boolean) => {
     const failed = (error: unknown) => {
       console.error("QueuePlugin failed to flush queued input", error)
       return toast(`Queue failed: ${error instanceof Error ? error.message : String(error)}`, "error")
@@ -540,49 +588,61 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
       target = await sessionTarget(sid)
     } catch (error) {
       await failed(error)
-      return items
+      return { retry: items, deferred: 0 }
     }
     let commands: Promise<Set<string> | undefined> | undefined
-    const send = async (item: ReplayItem) => {
+    const dispatch = async (item: ReplayItem) => {
+      let submit: () => Promise<unknown>
       switch (item.kind) {
         case "shell":
-          return shell(target, item.shell, item.info)
+          submit = () => shell(target, item.shell, item.info)
+          break
         case "compact":
-          return compact(target, item.info)
+          submit = () => compact(target, item.info)
+          break
         case "command": {
           const known = await (commands ??= knownCommands(target))
           // OpenCode answers an unknown command with a generic 500, so retrying it would wedge the queue.
           if (known && !known.has(item.cmd)) {
             await toast(`Command /${item.cmd} not found; sending it as a prompt`, "error", 5000)
-            return sendPrompt(target, item.info, [{ type: "text", text: item.source }, ...item.files])
+            submit = () => sendPrompt(target, item.info, [{ type: "text", text: item.source }, ...item.files])
+          } else {
+            submit = () => command(target, {
+              ...opts(item.info),
+              model: `${item.info.model.providerID}/${item.info.model.modelID}`,
+              command: item.cmd,
+              arguments: item.args,
+              parts: item.files,
+            })
           }
-          return command(target, {
-            ...opts(item.info),
-            model: `${item.info.model.providerID}/${item.info.model.modelID}`,
-            command: item.cmd,
-            arguments: item.args,
-            parts: item.files,
-          })
+          break
         }
         case "prompt":
-          return sendPrompt(target, item.info, item.parts)
+          submit = () => sendPrompt(target, item.info, item.parts)
       }
+      if (!authorize()) return false
+      await submit()
+      return true
     }
-    return (await Promise.all(items.map(async (item) => {
-      try {
-        await send(item)
-      } catch (error) {
-        await failed(error)
-        return item
-      }
-    }))).filter((item) => item !== undefined)
+    const outcomes = await Promise.allSettled(items.map((item) => dispatch(item).catch(async (error) => {
+      await failed(error)
+      throw error
+    })))
+    const retry: ReplayItem[] = []
+    let deferred = 0
+    for (const [i, outcome] of outcomes.entries()) {
+      if (outcome.status === "fulfilled" && outcome.value) continue
+      retry.push(items[i])
+      if (outcome.status === "fulfilled") deferred++
+    }
+    return { retry, deferred }
   }
 
   const advance = (sid: string) => {
     if (!queues.active || deleted.has(sid)) return
     const current = state(sid)
     if (!canAdvance(current)) return
-    void afterInput(sid, () => flush(sid, "next")).catch(async (error) => {
+    void afterInput(sid, () => flush(sid, { kind: "next" })).catch(async (error) => {
       console.error("QueuePlugin could not advance the persisted queue", error)
       await toast(`Queue persistence failed: ${error instanceof Error ? error.message : String(error)}`, "error", 5000)
     })
@@ -596,18 +656,26 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
     await toast(`${front ? "Queued first" : "Queued"}: ${itemText(item)}`, "info")
   }
 
-  const idle = (sid: string) => {
+  const idle = (sid: string, status = false) => {
     const current = state(sid)
     const previous = current.activity.kind
     if (previous === "restored" && !current.flight) return
+    // OpenCode also emits idle for aborts with no active runner. A second status
+    // idle, or one before a reserved send starts, invalidates the old finish.
+    // The paired, deprecated session.idle notification does not do this.
+    const unsent = current.gate !== "ready" && current.flight?.kind === "sending" && current.flight.batches.some((batch) => batch.phase === "reserved")
+    if (status && (previous === "idle" || unsent)) interrupt(current)
     current.activity = { kind: "idle" }
     if (previous === "busy") advance(sid)
   }
 
   const carry = async (sid: string, current: State, carrying: Carrying) => {
-    const eligible = () => !deleted.has(sid) && !current.failed && !(carrying.automatic && current.stopped) && current.items[0] === carrying.item
+    const eligible = () => {
+      const allowed = carrying.automatic ? queues.active && !current.stopped && current.gate === "ready" : current.gate !== "interrupted"
+      return allowed && !deleted.has(sid) && current.generation === carrying.generation && current.items[0] === carrying.item
+    }
     let created: Target | undefined
-    let destination: string | undefined
+    let destination: { id: string; generation: number } | undefined
     try {
       const observed = current.activity
       const target = await sessionTarget(sid)
@@ -621,6 +689,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
       // Live events received during the request take precedence over its snapshot.
       if (current.activity === observed) {
         const running = statuses.find(({ status }) => status && status.type !== "idle")
+        if (running && observed.kind !== "busy") begin(current)
         current.activity = running ? { kind: "busy", directory: running.directory } : { kind: "idle" }
       }
       if (current.activity.kind !== "idle") return "Queue is waiting for carry; the session must finish before continuing in a new session"
@@ -635,11 +704,14 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
         const next = state(nextID)
         const source: Draft = { items: [], stopped: current.stopped, hidden: current.hidden }
         const target: Draft = { items: current.items.slice(1), stopped: current.stopped, hidden: next.hidden }
-        await commit([current, source], [next, target])
-        return nextID
+        // Selection can await the TUI; do not release destination work meanwhile.
+        if (next.gate !== "interrupted") next.gate = "waiting"
+        const generation = next.generation
+        if (!await commit([[current, source], [next, target]], () => !deleted.has(nextID) && eligible() && current.activity.kind === "idle")) return undefined
+        return { id: nextID, generation }
       }))
     } catch (error) {
-      current.failed = true
+      current.gate = "interrupted"
       console.error("QueuePlugin failed to carry queued input", error)
       await toast(`Queue carry failed: ${error instanceof Error ? error.message : String(error)}`, "error", 5000)
       return "Queue carry failed; queued entries were kept for retry"
@@ -659,30 +731,39 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
     // The v1 plugin SDK has no selectSession method; use its authenticated client.
     try {
       if (!post) throw new Error("the SDK client has no internal request method")
-      const result = await post({ url: "/tui/select-session", body: { sessionID: destination }, headers: { "Content-Type": "application/json" } })
+      const result = await post({ url: "/tui/select-session", body: { sessionID: destination.id }, headers: { "Content-Type": "application/json" } })
       if (!result?.response?.ok) throw new Error(`TUI selection failed: ${JSON.stringify(result?.error ?? result?.response?.status)}`)
     } catch (error) {
       console.warn("QueuePlugin carried the queue but could not select the new session", error)
-      await toast(`Queue carried to ${destination}, but the TUI could not switch sessions`, "error", 5000)
+      await toast(`Queue carried to ${destination.id}, but the TUI could not switch sessions`, "error", 5000)
     }
-    advance(destination)
+    if (!deleted.has(destination.id)) {
+      const next = sessions.get(destination.id)
+      if (!next) throw new Error(`QueuePlugin lost track of carry destination ${destination.id}`)
+      if (next.generation === destination.generation) {
+        if (current.gate === "interrupted" || current.generation !== carrying.generation) interrupt(next)
+        else if (next.gate !== "interrupted") next.gate = "ready"
+      }
+    }
+    advance(destination.id)
     return "Carried queue to a new session"
   }
 
-  const flush = async (sid: string, mode: "next" | "all", placeholder?: Placeholder) => {
-    const automatic = mode === "next"
-    if (placeholder) await persist(sid, placeholder, () => undefined)
+  const flush = async (sid: string, request: Flush) => {
+    const automatic = request.kind === "next"
+    if (!automatic && request.placeholder) await persist(sid, request.placeholder, () => undefined)
     const reservation = await serialize(async () => {
       if (deleted.has(sid)) return undefined
       const current = state(sid)
+      if (!automatic && current.interruption !== request.interruption) return "Flush deferred because the session was interrupted"
       if (automatic && (!queues.active || !canAdvance(current))) return undefined
 
       if (current.flight?.kind === "carrying" || (current.items[0]?.kind === "carry" && current.flight)) {
         return "Queue is waiting for carry; the session must finish before continuing in a new session"
       }
       if (current.items[0]?.kind === "carry") {
-        const carrying: Carrying = { kind: "carrying", item: current.items[0], automatic }
-        if (!automatic) current.failed = false
+        const carrying: Carrying = { kind: "carrying", item: current.items[0], automatic, generation: current.generation }
+        if (!automatic) current.gate = completionGate(current)
         current.flight = carrying
         return { kind: "carry", current, carrying } as const
       }
@@ -693,12 +774,16 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
         if (automatic) break
       }
       if (!items.length) return undefined
-      if (!automatic) current.failed = false
+      if (!automatic) current.gate = completionGate(current)
 
       // Prompt requests stay pending until the agent finishes; new flushes can still steer it.
-      if (!current.flight) current.activity = { kind: "busy", directory }
+      if (!current.flight) {
+        if (current.activity.kind !== "busy") begin(current)
+        current.gate = "waiting"
+        current.activity = { kind: "busy", directory }
+      }
       const sending: Sending = current.flight ?? { kind: "sending", batches: [] }
-      const batch = { items, pending: true }
+      const batch: Batch = { items, phase: "reserved", generation: current.generation, interruption: current.interruption }
       sending.batches.push(batch)
       current.items = current.items.slice(items.length)
       current.flight = sending
@@ -711,26 +796,31 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
 
     const { current, sending, batch } = reservation
     const { items } = batch
-    const retry = await replay(sid, items)
+    const authorize = () => {
+      if (deleted.has(sid) || current.interruption !== batch.interruption || automatic && (!queues.active || current.stopped || current.gate === "interrupted" || current.generation !== batch.generation)) return false
+      batch.phase = "sending"
+      return true
+    }
+    const { retry, deferred } = await replay(sid, items, authorize)
     await serialize(async () => {
       if (sessions.get(sid) !== current) return
       if (current.flight !== sending) throw new Error(`QueuePlugin lost track of in-flight queued items for session ${sid}`)
 
-      batch.pending = false
+      batch.phase = "settled"
       batch.items = retry
-      if (retry.length) current.failed = true
+      if (retry.length > deferred) current.gate = "interrupted"
       try {
         await commit()
       } catch (error) {
         batch.items = items
-        current.failed = true
+        current.gate = "interrupted"
         throw error
       } finally {
-        if (!sending.batches.some((entry) => entry.pending)) {
+        if (sending.batches.every((entry) => entry.phase === "settled")) {
           const queued = sending.batches.flatMap((entry) => entry.items)
           if (queued.length) {
             current.items = [...queued, ...current.items]
-            current.activity = { kind: "idle" }
+            if (sending.batches.every((entry) => entry.generation === current.generation)) current.activity = { kind: "idle" }
           }
           current.flight = undefined
         }
@@ -739,42 +829,49 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
     advance(sid)
     const sent = items.length - retry.length
     const message = `Flushed ${sent} queued item${sent === 1 ? "" : "s"}`
-    return retry.length ? `${message}; ${retry.length} failed` : message
+    const failures = retry.length - deferred
+    return `${message}${failures ? `; ${failures} failed` : ""}${deferred ? `; ${deferred} deferred` : ""}`
   }
 
-  const manage = async (sid: string, op: ControlOp, placeholder?: Placeholder) => {
-    if (op.kind === "flush") return flush(sid, "all", placeholder)
-    if (op.kind === "list" && !placeholder) return serialize(async () => describeQueue(sessions.get(sid)))
+  const manage = (sid: string, op: ControlOp, placeholder?: Placeholder) => {
+    const current = state(sid)
+    if (op.kind === "stop") interrupt(current)
+    const interruption = current.interruption
+    return afterInput(sid, async () => {
+      if (op.kind === "flush") return flush(sid, { kind: "all", placeholder, interruption })
+      if (op.kind === "list" && !placeholder) return serialize(async () => describeQueue(sessions.get(sid)))
 
-    if (op.kind === "always") {
-      const enabled = await serialize(async () => {
-        if (op.enabled === undefined) return always.get()
-        await always.set(op.enabled)
-        return op.enabled
-      })
-      if (placeholder) await persist(sid, placeholder, () => undefined)
-      return `Always queue is ${enabled ? "on" : "off"} ${always.scope}`
-    }
-
-    const message = await persist(sid, placeholder, (draft) => {
-      switch (op.kind) {
-        case "list":
-          return describeQueue(draft)
-        case "clear":
-          return clear(draft, op.indices)
-        case "stop":
-          draft.stopped = true
-          return "Queue stopped"
-        case "start":
-          draft.stopped = false
-          return "Queue started"
+      if (op.kind === "always") {
+        const enabled = await serialize(async () => {
+          if (op.enabled === undefined) return always.get()
+          await always.set(op.enabled)
+          return op.enabled
+        })
+        if (placeholder) await persist(sid, placeholder, () => undefined)
+        return `Always queue is ${enabled ? "on" : "off"} ${always.scope}`
       }
+
+      const message = await persist(sid, placeholder, (draft) => {
+        switch (op.kind) {
+          case "list":
+            return describeQueue(draft)
+          case "clear":
+            return clear(draft, op.indices)
+          case "stop":
+            draft.stopped = true
+            return "Queue stopped"
+          case "start":
+            if (current.interruption !== interruption) return "Queue resume deferred because the session was interrupted"
+            draft.stopped = false
+            return "Queue started"
+        }
+      })
+      if (op.kind === "start" && current.interruption === interruption) {
+        current.gate = current.activity.kind === "idle" ? "ready" : completionGate(current)
+        advance(sid)
+      }
+      return message
     })
-    if (op.kind === "start") {
-      state(sid).failed = false
-      advance(sid)
-    }
-    return message
   }
 
   const hooks: Awaited<ReturnType<Plugin>> & { dispose: () => Promise<void> } = {
@@ -783,23 +880,60 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
       cfg.command ??= {}
       for (const [name, description] of Object.entries(COMMANDS)) cfg.command[name] = { template: "", description }
     },
-    event: async ({ event }) => {
-      if (plan(event)) {
+    event: async ({ event: incoming }) => {
+      // The plugin hook still uses stale v1 types; runtime events follow the v2 SDK.
+      // Remove the cast when the hook accepts v2 events.
+      const event = incoming as Event
+      if (event.type === "question.asked") {
+        const question = event.properties.questions[0]
         const sid = event.properties.sessionID
-        if (!shouldDeclinePlan(sessions.get(sid))) return
+        if (question?.header !== "Build Agent" || !question.question.includes("switch to the build agent") || !shouldDeclinePlan(sessions.get(sid))) return
         await no(event.properties.id)
         await toast("Declined plan approval to continue queued work", "info")
         return
       }
 
-      if (event.type === "session.error") {
+      if (event.type === "session.error" || event.type === "question.rejected" || event.type === "permission.replied" && event.properties.reply === "reject") {
         const sid = event.properties.sessionID
         if (!sid) {
-          console.warn("QueuePlugin could not suppress queued replay after session.error because the event has no sessionID")
+          console.warn(`QueuePlugin could not suppress queued replay after ${event.type} because the event has no sessionID`)
           return
         }
         if (deleted.has(sid)) return
-        state(sid).failed = true
+        interrupt(state(sid))
+        return
+      }
+
+      if (event.type === "message.updated") {
+        const info = event.properties.info
+        if (deleted.has(info.sessionID)) return
+        const current = state(info.sessionID)
+        if (info.role === "assistant") {
+          observe(current, info)
+        } else if (!current.hidden.has(info.id) && !older(info, current.user) && info.id !== current.user?.id) {
+          current.user = { id: info.id, created: info.time.created }
+          begin(current)
+        }
+        return
+      }
+
+      if (event.type === "message.part.updated") {
+        const part = event.properties.part
+        if (deleted.has(part.sessionID)) return
+        const current = state(part.sessionID)
+        if (part.type === "text" && part.synthetic && part.text === "The following tool was executed by the user" && part.messageID === current.user?.id) current.user.shell = true
+        if (part.type !== "tool" || part.messageID === current.boundary || part.messageID !== current.last?.id) return
+        if (part.state.status === "error" && part.state.metadata?.interrupted === true) interrupt(current)
+        if (part.metadata?.providerExecuted) return
+        if (current.last.result !== "structured" && current.last.result !== "shell") current.last.result = "tools"
+        if (part.tool === "bash" && current.user?.shell && current.last.parentID === current.user.id && part.state.status === "completed") {
+          if (part.state.output.endsWith("\n\n<metadata>\nUser aborted the command\n</metadata>")) {
+            interrupt(current)
+          } else {
+            current.last.result = "shell"
+          }
+        }
+        refreshGate(current)
         return
       }
 
@@ -826,12 +960,16 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
       if (deleted.has(sid)) return
       const current = state(sid)
       if (event.properties.status.type !== "idle") {
+        // Busy/retry events repeat within a run; only a new run clears an interruption.
+        if (current.activity.kind !== "busy") {
+          if (!current.flight) current.gate = "waiting"
+          begin(current)
+        }
         current.activity = { kind: "busy", directory }
-        if (!current.flight) current.failed = false
         return
       }
 
-      idle(sid)
+      idle(sid, true)
     },
     "command.execute.before": async (input, output) => {
       const sid = input.sessionID
@@ -863,7 +1001,9 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
       const parts = files(output.parts)
       const op = parse(request, parts.length)
 
-      if (control(op)) return stop(await afterInput(sid, () => manage(sid, op)))
+      if (control(op)) {
+        return stop(await manage(sid, op))
+      }
       if (op.kind === "invalid") return stop(op.message, "error")
       if (op.kind === "carry") {
         await orderedInput(sid, () => enqueue(sid, { kind: "carry" }, isFront(request.command)))
@@ -937,7 +1077,7 @@ export const QueuePlugin: Plugin = async ({ client, project, directory, serverUr
       }
 
       if (control(op)) {
-        await toast(await afterInput(sid, () => manage(sid, op, placeholder)), "info", 5000)
+        await toast(await manage(sid, op, placeholder), "info", 5000)
         return
       }
 

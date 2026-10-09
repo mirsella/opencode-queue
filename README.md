@@ -84,15 +84,17 @@ When the session is busy:
 - Queued entries are hidden from the transcript and from the running agent.
 - The current agent run keeps using its original agent, model, and thinking variant.
 - Each queued entry replays with the agent, model, and thinking variant selected when it was queued.
-- Queued entries replay in order after the session completes normally and becomes idle.
+- Queued entries replay in order after a completed, error-free model response and an idle transition. Idle events alone do not trigger replay; unfinished turns, tool-call steps, output limits, and provider errors keep entries queued.
 - `/queue:front ...` puts an entry before the existing queued entries.
 - `/queue:now ...` sends prompts and slash commands immediately regardless of queue state or mode. Shell commands remain queued until the session is idle.
 - Only one queued entry is sent per idle transition, so queued work runs one item at a time.
 - Queued entries are kept in place after an error, abort, crash, or restart.
+- After aborting a run, dismissing a question with Escape, or rejecting a permission request, queued entries wait for `/queue:start`, `/queue:flush`, or a new agent run that finishes successfully. Repeated busy/retry events within an interrupted run do not resume the queue.
 - A queued slash command that no longer exists when its turn comes is sent as a plain prompt instead of failing the queue.
 - `/queue:stop` pauses automatic replay without clearing queued entries, and `/queue:start` resumes it.
 - `/queue:always-on` also queues plain prompts and custom slash commands while the session is busy, paused, or already has queued work. OpenCode does not expose native shell or `/compact` submissions to these plugin hooks.
 - `/queue:flush` submits waiting entries up to the next carry boundary immediately, even while a previous replay is still running. Prompts appear in the conversation as normal steering messages with OpenCode's queued indicator; the current run is not aborted and already-submitted entries are not resent.
+- Replay checks for interruptions again after session and command lookups, before submitting an entry. A stop also cancels entries from an earlier `/queue:flush` that have not been submitted yet. Successful queued shell blocks and compactions can continue the queue; aborted shell blocks cannot.
 
 When the session is idle, `/queue` input runs immediately. Bare `/queue` and queue controls work whether the session is idle or busy.
 
@@ -184,6 +186,7 @@ Migrating while keeping the plugin's own queue and current features requires the
 
 ## Notes
 
+- OpenCode's current plugin API has no distinct event for an abort after the final assistant response has already been marked complete. That boundary case is indistinguishable from normal completion.
 - It does not add a keyboard shortcut. OpenCode plugins cannot currently register custom TUI keybindings.
 - Queued placeholders are hidden instead of deleted, then filtered out before messages are sent to the model.
 - If plan mode asks to switch to the build agent while more queued work is waiting, the plugin answers `No` so the queue can continue.
