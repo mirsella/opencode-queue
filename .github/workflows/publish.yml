@@ -41,7 +41,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           tag=$(node -p 'require("./package.json").publishConfig.tag')
           case "$version:$tag" in
-            1.*:latest|2.*:v2) ;;
+            1.*:latest|2.*:opencode2) ;;
             *) echo "Unexpected version/channel: $version:$tag" >&2; exit 1 ;;
           esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"

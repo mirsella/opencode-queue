@@ -2,7 +2,7 @@
 
 A persistent queue for prompts, slash commands, shell commands, and fresh-session boundaries. Entries stay private until released and remember their agent, model, thinking variant, and files.
 
-Version **2.x requires OpenCode v2, 2.0.27 or newer**. For OpenCode v1, use [1.x](https://github.com/mirsella/opencode-queue/tree/v1.0.0#install), tested against OpenCode 1.19.0. npm’s `latest` stays on v1 so existing unversioned installations remain compatible; the `v2` tag follows the v2 port.
+Version **2.x requires OpenCode v2, 2.0.27 or newer**. For OpenCode v1, use [1.x](https://github.com/mirsella/opencode-queue/tree/v1.0.0#install), tested against OpenCode 1.19.0. npm’s `latest` stays on v1 so existing unversioned installations remain compatible; the `opencode2` tag follows the v2 port.
 
 ## Install
 
@@ -10,7 +10,7 @@ Add the package to your OpenCode configuration and restart:
 
 ```json
 {
-  "plugins": ["opencode-queue@v2"]
+  "plugins": ["opencode-queue@opencode2"]
 }
 ```
 

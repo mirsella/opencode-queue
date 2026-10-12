@@ -42,7 +42,7 @@
   },
   "publishConfig": {
     "access": "public",
-    "tag": "v2"
+    "tag": "opencode2"
   },
   "scripts": {
     "test": "tsx --test src/*.test.ts",
