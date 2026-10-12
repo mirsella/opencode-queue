@@ -3,21 +3,11 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": [
-      "ESNext",
-      "DOM"
-    ],
-    "types": [
-      "node"
-    ],
+    "lib": ["ESNext", "DOM"],
+    "types": ["node"],
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": [
-    "index.ts",
-    "tui.ts",
-    "src/**/*.ts",
-    "test/**/*.ts"
-  ]
+  "include": ["index.ts"]
 }

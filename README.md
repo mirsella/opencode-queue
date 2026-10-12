@@ -1,73 +1,192 @@
 # opencode-queue
 
-A persistent queue for prompts, slash commands, shell commands, and fresh-session boundaries. Entries stay private until released and remember their agent, model, thinking variant, and files.
+[![npm version](https://img.shields.io/npm/v/opencode-queue?color=cb3837)](https://www.npmjs.com/package/opencode-queue)
+[![CI](https://github.com/mirsella/opencode-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/opencode-queue/actions/workflows/ci.yml)
+[![npm downloads](https://img.shields.io/npm/dm/opencode-queue)](https://www.npmjs.com/package/opencode-queue)
 
-Version 0.20 requires **OpenCode v2, 2.0.27 or newer**. For OpenCode v1, use the [0.18.1 release](https://github.com/mirsella/opencode-queue/tree/v0.18.1#install).
+Queue OpenCode input until the current session is idle.
+
+`opencode-queue` adds `/queue`, its shorter `/q` alias, and dedicated commands for queue controls. It lets you type the next prompt, slash command, or shell command while an agent is still working, without interrupting the current run.
 
 ## Install
 
-Add the package to your OpenCode configuration and restart:
+Add the plugin to your OpenCode config:
 
-```json
+```jsonc
 {
-  "plugins": ["opencode-queue"]
+  "plugin": ["opencode-queue"]
 }
 ```
 
-OpenCode installs the latest package and loads its server and TUI entrypoints. V2 uses `plugins` (plural); v1 used `plugin`.
+Restart OpenCode after installing. OpenCode installs npm plugins automatically at startup.
 
-## Commands
+## Quick examples
 
-Enter these in OpenCode's normal input:
-
-| Input | Behavior |
-| --- | --- |
-| `/queue text`, `/q text` | Queue an entry with the selected agent/model/variant and attachments. |
-| `/queue`, `/queue:list` | Show waiting entries in OpenCode's built-in dialog. |
-| `/queue:front text` | Insert before waiting entries. |
-| `/queue:now text` | Steer immediately, changing settings at the next model checkpoint if needed. Shell entries wait for idle. |
-| `/queue /review arguments` | Save a slash command and expand it when released. |
-| `/queue /compact` | Compact with the saved agent/model/variant. |
-| `/queue !command` | Run a shell command after the session becomes idle. |
-| `/queue:carry`, `/queue:carry-front` | Transfer following entries into a fresh session at this boundary. |
-| `/queue:clear`, `/queue:clear 2 4` | Remove all waiting entries or selected numbered entries. |
-| `/queue:stop`, `/queue:start` | Pause or resume replay. |
-| `/queue:abort` | Cancel active work and pause replay, including a queued shell or pending model switch. |
-| `/queue:flush` | Release waiting entries through the next carry boundary. |
-| `/queue:apply_model` | Apply the selected model and variant to unsent entries, keeping their agents, files, and order. |
-
-## Replay
-
-Replay releases one entry after a successful final response and an idle transition. Tool continuations, output limits, failed compactions, provider failures, and interruptions hold the queue. Resume with `/queue:start` or `/queue:flush`, or complete a new successful run.
-
-`/queue:now` can switch the active model at the next checkpoint: a running tool finishes, then the plugin stops the old execution, switches settings, and continues in the same conversation. Flush groups matching agent/model/variant selections; each new group waits for the previous one to finish successfully.
-
-Carry boundaries create an empty session in the current directory and transfer the remaining entries, files, and paused state. The TUI follows the new session. A failed transfer leaves the source intact. Flush stops at the boundary.
-
-Slash commands resolve when released. If a command was removed, its original text becomes a prompt. Shell commands use `$SHELL` and show output as a plugin message, with a bounded preview and a full log. Failed or cancelled shell commands stay queued for an explicit retry.
-
-## Removed in v2
-
-Trailing `prompt /queue` and `prompt /q`, automatic queueing of ordinary input, and the custom composer have been removed. Use `/queue prompt` in OpenCode's native input. Ordinary prompts follow OpenCode's own submission behavior.
-
-The public v2 API lacks native composer access and a way to consume a submission before it enters the conversation. Related upstream requests:
-
-- [#51209: expose the native composer to plugins](https://github.com/anomalyco/opencode/issues/51209).
-- [#51392: text and paste interception for TUI plugins](https://github.com/anomalyco/opencode/issues/51392).
-- [#30434: cancellable message hooks](https://github.com/anomalyco/opencode/issues/30434), a historical v1 request closed as not planned.
-
-## Storage
-
-Queues use `opencode-queue/queues.json` in OpenCode's user data directory. Upgrading from v1 resets pending queues. Entries survive restarts and `/move`, including moves between projects. One server should own a data directory.
-
-Writes are atomic. Replay reuses prompt message IDs; commands and shells can repeat if the server crashes between execution and recording completion.
-
-## Try in Docker
-
-From this repository, open OpenCode v2 with the plugin loaded:
-
-```sh
-pnpm start:docker
+```text
+/queue
+/q continue after this task
+continue after this task /queue
+/queue:front do this next
+/queue:now send this immediately
+/queue /review
+/review /queue
+/queue /compact
+/queue !ls
+/queue:carry
+/queue start the next task in a fresh session
+/queue:list
+/queue:apply_model
+/queue:stop
+/queue:start
+/queue:flush
+/queue:clear
+/queue:clear 2 3
 ```
 
-Existing provider credentials are copied on the first launch. Sessions stay in a separate Docker volume.
+## Syntax
+
+`/q` is an alias for `/queue` when adding input. The control commands use the `/queue:` prefix.
+
+| Input | What it does |
+| --- | --- |
+| `/queue` or `/q` | Show the current queue. |
+| `/queue message` | Queue a normal prompt. |
+| `message /queue` | Queue a normal prompt using trailing syntax. |
+| `/queue:front message` | Queue a normal prompt before existing queued entries. |
+| `/queue:now input` | Send a prompt or slash command immediately. Shell commands still wait until the session is idle. |
+| `/queue /review` | Queue a slash command. |
+| `/review /queue` | Queue a slash command using trailing syntax. |
+| `/queue:front /review` | Queue a slash command before existing queued entries. |
+| `/queue /compact` | Queue OpenCode's built-in TUI `/compact` command. |
+| `/queue:front /compact` | Queue OpenCode's built-in TUI `/compact` command before existing queued entries. |
+| `/queue !ls` | Queue an OpenCode shell block. |
+| `/queue:front !ls` | Queue an OpenCode shell block before existing queued entries. |
+| `/queue:carry` | Queue a boundary that moves the remaining queue to a fresh session. |
+| `/queue:carry-front` | Put a fresh-session boundary before existing queued entries. |
+| `/queue:list` | Show the current queue. |
+| `/queue:apply_model` | Apply the currently selected model and thinking variant to all waiting entries in the current queue. |
+| `/queue:stop` | Pause automatic sending of queued entries. |
+| `/queue:start` | Resume automatic sending of queued entries. |
+| `/queue:always` | Show whether automatic queueing is enabled and its scope. |
+| `/queue:always-on` | Enable automatic queueing globally, or locally when `OPENCODE_QUEUE_ALWAYS` is set. |
+| `/queue:always-off` | Disable automatic queueing globally, or locally when `OPENCODE_QUEUE_ALWAYS` is set. |
+| `/queue:flush` | Send waiting entries immediately, up to the next carry boundary. |
+| `/queue:clear` | Clear the current queue, including carry boundaries. |
+| `/queue:clear 1` | Clear item 1 from the current queue, whether it is input or a carry boundary. |
+| `/queue:clear 2 3` | Clear items 2 and 3 from the current queue. |
+
+Words after `/queue` and `/q` are always input, not controls. For example, `/queue front page is unreachable` queues the whole phrase. Use bare `/queue` or `/queue:list` to inspect the queue.
+
+## Behavior
+
+When the session is busy:
+
+- Queued entries are hidden from the transcript and from the running agent.
+- The current agent run keeps using its original agent, model, and thinking variant.
+- Each queued entry replays with the agent, model, and thinking variant selected when it was queued.
+- Queued entries replay in order after a completed, error-free model response and an idle transition. Idle events alone do not trigger replay; unfinished turns, tool-call steps, output limits, and provider errors keep entries queued.
+- `/queue:front ...` puts an entry before the existing queued entries.
+- `/queue:now ...` sends prompts and slash commands immediately regardless of queue state or mode. Shell commands remain queued until the session is idle.
+- Only one queued entry is sent per idle transition, so queued work runs one item at a time.
+- Queued entries are kept in place after an error, abort, crash, or restart.
+- After aborting a run, dismissing a question with Escape, or rejecting a permission request, queued entries wait for `/queue:start`, `/queue:flush`, or a new agent run that finishes successfully. Repeated busy/retry events within an interrupted run do not resume the queue.
+- A queued slash command that no longer exists when its turn comes is sent as a plain prompt instead of failing the queue.
+- `/queue:stop` pauses automatic replay without clearing queued entries, and `/queue:start` resumes it.
+- `/queue:always-on` also queues plain prompts and custom slash commands while the session is busy, paused, or already has queued work. OpenCode does not expose native shell or `/compact` submissions to these plugin hooks.
+- `/queue:flush` submits waiting entries up to the next carry boundary immediately, even while a previous replay is still running. Prompts appear in the conversation as normal steering messages with OpenCode's queued indicator; the current run is not aborted and already-submitted entries are not resent.
+- Replay checks for interruptions again after session and command lookups, before submitting an entry. A stop also cancels entries from an earlier `/queue:flush` that have not been submitted yet. Successful queued shell blocks and compactions can continue the queue; aborted shell blocks cannot.
+
+When the session is idle, `/queue` input runs immediately. Bare `/queue` and queue controls work whether the session is idle or busy.
+
+Queues are scoped to the current project and session. Using OpenCode's `/move` to change a session's directory keeps its queue, selected models, attachments, and running or stopped state. Queued work replays in the session's current directory.
+
+Queues are stored in OpenCode's user data directory and restored with their previous running or stopped state after OpenCode restarts or crashes. Restored queues do not replay just because the session starts idle; a running queue resumes after the session becomes busy and then finishes successfully. A send interrupted by a crash remains queued because the plugin cannot know whether OpenCode accepted it before exiting.
+
+## Change queued models
+
+Select a model and thinking variant, then run `/queue:apply_model` with no arguments or attachments. It updates every waiting entry in the current session's queue, including entries after carry boundaries, and saves the changes across restarts. Selecting no variant clears each entry's previous variant.
+
+Each entry keeps its agent, content, and attachments. Already-submitted entries keep their original settings. The command preserves the queue's running or stopped state.
+
+## Automatic queueing
+
+By default, `/queue:always-on` and `/queue:always-off` save a global setting shared by every OpenCode project. Changes apply to running instances without restarting them. Automatic queueing is off until enabled.
+
+To preconfigure an OpenCode instance, set `OPENCODE_QUEUE_ALWAYS` when starting it:
+
+```sh
+OPENCODE_QUEUE_ALWAYS=1 opencode
+OPENCODE_QUEUE_ALWAYS=0 opencode
+```
+
+`1`, `true`, and `on` enable automatic queueing. `0`, `false`, and `off` disable it. Values are case-insensitive and surrounding whitespace is ignored. An unset or empty value uses the global setting. Other values cause plugin initialization to fail with an error.
+
+The plugin reads the variable at initialization. It overrides the global setting without writing to `settings.json`. With this override active, `/queue:always-on` and `/queue:always-off` change only the in-memory value for the current project's plugin instance. Sessions within that instance share the value; other instances keep their own settings. Reloading the plugin or restarting OpenCode resets the override to the environment value.
+
+`/queue:always` reports the effective value and whether it applies globally or to this instance. `/queue:now` still bypasses automatic queueing for prompts and slash commands.
+
+## Carry between sessions
+
+`/queue:carry` adds a fresh-session boundary to the queue. When it reaches the front, the plugin checks the live session status and waits for the current run and any in-flight replays to finish. It then creates a session in the current directory, transfers the remaining queue, and switches the TUI to it.
+
+The new session starts with an empty conversation. Each entry keeps its selected agent, model, thinking variant, and attachments. If a carry is cancelled or its transfer fails after session creation, the plugin removes the unused new session.
+
+For example, while the first task is running:
+
+```text
+/queue finish the first task
+/queue:carry
+/queue implement the second task
+/queue:carry
+/queue implement the third task
+```
+
+`/queue:list` shows every boundary, with item numbers shared across the whole queue:
+
+```text
+1. finish the first task
+2. --- carry: new session 1 ---
+3. implement the second task
+4. --- carry: new session 2 ---
+5. implement the third task
+```
+
+Carry boundaries work with the usual queue controls:
+
+- `/queue:carry-front` puts a carry before all waiting entries, so they move to a fresh session after the current run finishes.
+- `/queue:clear 2` removes the first boundary in the example above, so the second task runs in the current session instead. Use the item number shown by `/queue:list`.
+- `/queue:clear` clears the whole queue, including carry boundaries.
+
+The previous session's queue becomes empty after the transfer. Boundaries survive restarts along with the rest of the queue. A failed session creation or transfer leaves the source queue intact for retry with `/queue:start` or `/queue:flush`.
+
+`/queue:flush` respects session boundaries. It sends only the entries before the next carry, which waits for the current run and any in-flight replays to finish. Automatic replay then continues one entry at a time in the new session. A stopped queue stays stopped when carried. An idle carry with nothing after it opens an empty session. Consecutive carries each open a fresh session.
+
+Carry does not accept arguments or attachments. `/queue:now carry` sends the word `carry` as a prompt.
+
+## Remaining blockers for OpenCode v2
+
+Migrating while keeping the plugin's own queue and current features requires these APIs:
+
+- Expose existing session APIs to server plugins ([#47229](https://github.com/anomalyco/opencode/issues/47229)):
+  - `context.session.shell()` to replay queued shell commands.
+  - `context.session.active()` to check activity without waiting for idle.
+
+- Add a submission hook that lets plugins capture and consume input:
+  - Cover prompts, slash commands, shell input, and `/compact`.
+  - Run before agent/model changes, command callbacks, or message admission.
+  - Include the full text, attachments, input mode, raw command, and selected agent/model/variant.
+  - Let the plugin handle input successfully without adding a transcript message or starting execution.
+  - The prompt hook from [#45550](https://github.com/anomalyco/opencode/pull/45550) supports rewriting, but does not provide this full interception.
+  - The composer APIs in [#51209](https://github.com/anomalyco/opencode/issues/51209) and [#51490](https://github.com/anomalyco/opencode/pull/51490) cover reading, appending, and focusing input, rather than consuming submissions.
+
+- Bind saved settings to each released input ([#48356](https://github.com/anomalyco/opencode/issues/48356)):
+  - Accept saved agent/model/variant settings on prompts and commands, and the saved model on compaction.
+  - Apply settings when the input is delivered, without changing work already running.
+  - Preserve this behavior for `/queue:now` and `/queue:flush`, which can submit input while the session is busy.
+
+## Notes
+
+- OpenCode's current plugin API has no distinct event for an abort after the final assistant response has already been marked complete. That boundary case is indistinguishable from normal completion.
+- It does not add a keyboard shortcut. OpenCode plugins cannot currently register custom TUI keybindings.
+- Queued placeholders are hidden instead of deleted, then filtered out before messages are sent to the model.
+- If plan mode asks to switch to the build agent while more queued work is waiting, the plugin answers `No` so the queue can continue.

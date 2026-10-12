@@ -20,18 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.32.1
-
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-          cache: pnpm
+          cache: npm
 
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      - run: npm ci
+      - run: npm run typecheck
 
       - id: package
         run: |
@@ -39,11 +35,6 @@ jobs:
           version=$(node -p 'require("./package.json").version')
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [[ "$version" == *-* ]]; then
-            echo "tag=next" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
 
       - id: published
         run: |
@@ -59,4 +50,4 @@ jobs:
         run: npm pack --dry-run
 
       - if: (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && steps.published.outputs.exists != 'true'
-        run: npm publish --tag "${{ steps.package.outputs.tag }}"
+        run: npm publish
