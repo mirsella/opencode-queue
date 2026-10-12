@@ -5,7 +5,7 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { once, EventEmitter } from "node:events"
 import { copyFile, cp, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { OpenCode, type V2Event } from "@opencode/client"
 import { QueueRpc } from "../src/rpc.js"
 import { TestRpc } from "./helper-plugin.js"
@@ -269,6 +269,32 @@ test("moving to another project retains the existing queue and its controls", { 
   const start = events.length; reply(next); await terminal(id, start)
 })
 
+test("v1 migration replays the saved model, variant and file through the native v2 server", { timeout: 40_000 }, async () => {
+  const id = await create(), uri = `data:text/plain;base64,${Buffer.from("migrated attachment").toString("base64")}`
+  const projectID = "legacy-project", text = "[queue-test:migrated]"
+  stream.abort(); await stopServer(); await feed.catch(() => {})
+  const storage = join(root, "data", "opencode", "opencode-queue")
+  await mkdir(storage, { recursive: true })
+  await writeFile(join(storage, `${createHash("sha256").update(projectID).digest("hex")}.json`), JSON.stringify({
+    version: 1, projectID, sessions: { [id]: { stopped: true, hidden: [], items: [{ kind: "prompt", body: text,
+      info: { agent: B.agent, model: { providerID: B.model.providerID, modelID: B.model.id }, variant: B.model.variant },
+      parts: [{ type: "text", text }, { type: "file", mime: "text/plain", url: uri, filename: "migrated.txt" }],
+    }] } },
+  }))
+  stream = new AbortController(); await startServer()
+  const saved = await queue.snapshot({ sessionID: id })
+  assert.equal(saved.stopped, true)
+  assert.equal(saved.gate, "waiting")
+  assert.equal(saved.items[0]?.prompt.files?.[0]?.uri, uri)
+  assert.deepEqual(saved.items[0]?.selection, B)
+  await submit(id, "/queue:start")
+  const migrated = await request("migrated")
+  assert.equal(migrated.model, "b")
+  assert.equal(migrated.variant, "high")
+  assert.ok(JSON.stringify(migrated.body).includes("migrated attachment"))
+  const start = events.length; reply(migrated); await terminal(id, start)
+})
+
 test("a server restart retains paused queues, attachments and saved selection", { timeout: 40_000 }, async () => {
   const id = await create(), uri = `data:text/plain;base64,${Buffer.from("persistent attachment").toString("base64")}`
   await submit(id, "/queue:stop")
@@ -278,7 +304,7 @@ test("a server restart retains paused queues, attachments and saved selection", 
   const saved = await queue.snapshot({ sessionID: id })
   assert.equal(saved.stopped, true); assert.equal(saved.gate, "waiting")
   assert.equal(saved.items[0]?.prompt.files?.[0]?.uri, uri)
-  assert.equal(saved.items[0]?.selection.model.id, "b")
+  assert.equal(saved.items[0]?.selection?.model.id, "b")
   await submit(id, "/queue:start")
   const restored = await request("restored")
   assert.equal(restored.model, "b"); assert.equal(restored.variant, "high")
@@ -328,8 +354,8 @@ test("native TUI slash commands queue privately and list entries in the native d
     await snapshot((value) => value.items.length === 1)
     const saved = await queue.snapshot({ sessionID: id })
     assert.equal(saved.items[0]?.prompt.text, "[queue-test:tui]")
-    assert.equal(saved.items[0]?.selection.model.id, "a")
-    assert.equal(saved.items[0]?.selection.model.variant, "default")
+    assert.equal(saved.items[0]?.selection?.model.id, "a")
+    assert.equal(saved.items[0]?.selection?.model.variant, "default")
     assert.ok(!JSON.stringify(await client.session.context({ sessionID: id })).includes("queue-test:tui"))
     ui.stdin!.write("/queue:list ")
     await wait(() => plain().includes("/queue:list") ? true : undefined, "native list command input")

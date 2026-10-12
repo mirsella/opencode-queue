@@ -12,7 +12,10 @@ export type QueuedInput = { prompt: Prompt } & (
   | { kind: "shell"; command: string }
   | { kind: "carry" }
 )
-export type Entry = { id: string; selection: Selection } & QueuedInput
+export type Entry = { id: string } & (
+  | { kind: "carry"; prompt: Prompt; selection?: Selection }
+  | (Exclude<QueuedInput, { kind: "carry" }> & { selection: Selection })
+)
 export const commands = {
   queue: "Queue input or show waiting entries",
   q: "Queue input or show waiting entries",

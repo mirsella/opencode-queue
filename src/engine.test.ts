@@ -42,6 +42,28 @@ function fixture(restored?: Store) {
   return { engine, host, sessions, sent, notices, errors, actions, input, submit, wait, disk: () => disk }
 }
 
+test("a migrated carry waits while paused and creates its destination with the source selection", async () => {
+  const f = fixture({ version: 2, sessions: { one: { stopped: true, receipts: {}, items: [
+    { id: "legacy-carry", kind: "carry", prompt: { text: "/queue:carry" } },
+    { id: "legacy-prompt", kind: "prompt", prompt: { text: "after carry" }, selection: A },
+  ] } } })
+  const create = f.host.create
+  let inherited: Selection | undefined
+  f.host.create = async (source, selection) => { inherited = selection; return create(source, selection) }
+  try {
+    f.sessions.get("one")!.selection = structuredClone(B)
+    await f.submit("/queue:flush")
+    await f.engine.settled()
+    assert.equal(f.sessions.size, 1)
+    assert.equal((await f.engine.snapshot("one")).items.length, 2)
+    await f.submit("/queue:start")
+    await f.engine.settled()
+    assert.deepEqual(inherited, B)
+    assert.equal(f.sent[0]?.item.prompt.text, "after carry")
+    assert.deepEqual(f.sent[0]?.item.selection, A)
+  } finally { await f.engine.dispose() }
+})
+
 test("parses queue syntax, commands, shells and carries without mutating attachments", () => {
   const files = [{ uri: "file:///image.png" }]
   const prompt = { text: "/queue /review diff", files }
@@ -102,7 +124,7 @@ test("private FIFO advances once per successful completed execution", async () =
   assert.deepEqual(f.sent.map(({ item }) => item.prompt.text), ["first"])
   assert.equal((await f.engine.snapshot("one")).items.length, 1)
   f.engine.completed("one", "stop"); await f.engine.observe("one", "succeeded"); await f.engine.settled()
-  assert.equal(f.sent[1]!.item.selection.agent, "plan")
+  assert.equal(f.sent[1]!.item.selection?.agent, "plan")
   assert.deepEqual(f.sessions.get("one")!.selection, B)
   await f.engine.dispose()
 })
@@ -226,6 +248,37 @@ test("carry transfers pending entries, settings, attachments and the current dir
   await f.engine.dispose()
 })
 
+test("a migrated carry uses its source session selection and preserves following entries", async () => {
+  const restored: Store = { version: 2, migratedV1: { legacy: "digest" }, sessions: { one: { stopped: true, receipts: {}, items: [
+    { id: "msg_legacy_carry", kind: "carry", prompt: { text: "/queue:carry" } },
+    { id: "msg_legacy_prompt", kind: "prompt", selection: B, prompt: { text: "following", files: [{ uri: "file:///image.png" }] } },
+  ] } } }
+  const f = fixture(restored)
+  try {
+    await f.submit("/queue:start")
+    await f.engine.settled()
+    assert.deepEqual(f.sessions.get("new-1")?.selection, B)
+    assert.deepEqual(f.sent[0]?.item, restored.sessions.one!.items[1])
+    assert.deepEqual(f.disk().migratedV1, { legacy: "digest" })
+    assert.ok(f.notices.some(notice => notice.kind === "carry" && notice.destination === "new-1"))
+  } finally { await f.engine.dispose() }
+})
+
+test("a migrated carry without a source selection remains queued with an explicit error", async () => {
+  const carry: Entry = { id: "msg_legacy_carry", kind: "carry", prompt: { text: "/queue:carry" } }
+  const f = fixture({ version: 2, sessions: { one: { stopped: true, receipts: {}, items: [carry] } } })
+  delete f.sessions.get("one")!.selection
+  try {
+    await f.submit("/queue:start")
+    await f.engine.settled()
+    const snapshot = await f.engine.snapshot("one")
+    assert.deepEqual(snapshot.items, [carry])
+    assert.match(snapshot.error!, /needs a model and agent selected/)
+    assert.equal(f.sessions.size, 1)
+    assert.equal(f.errors.length, 1)
+  } finally { await f.engine.dispose() }
+})
+
 test("apply_model keeps agents and carry boundaries and clears unspecified variants", async () => {
   const f = fixture()
   await f.submit("/queue:stop"); await f.submit("/queue one", A); await f.submit("/queue:carry"); await f.submit("/queue two", B)
@@ -311,7 +364,7 @@ test("queue controls protect the active entry while editing numbered waiting ent
     await f.submit("/queue:apply_model", B); await f.submit("/queue:clear 1")
     const snapshot = await f.engine.snapshot("one")
     assert.deepEqual(snapshot.sending, [snapshot.items[0]!.id])
-    assert.deepEqual(snapshot.items.map((item) => [item.prompt.text, item.selection.model.id]), [["active", "a"], ["third", "b"]])
+    assert.deepEqual(snapshot.items.map((item) => [item.prompt.text, item.selection?.model.id]), [["active", "a"], ["third", "b"]])
     held.resolve(); await f.engine.settled()
     assert.equal(f.sent.length, 1)
     f.engine.completed("one", "stop"); await f.engine.observe("one", "succeeded"); await f.engine.settled()

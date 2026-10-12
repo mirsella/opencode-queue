@@ -15,9 +15,9 @@ const EntrySchema = Schema.Union([
   Schema.Struct({ ...Base, kind: Schema.Literal("command"), command: Schema.String }),
   Schema.Struct({ ...Base, kind: Schema.Literal("shell"), command: Schema.String }),
   Schema.Struct({ ...Base, kind: Schema.Literal("compact") }),
-  Schema.Struct({ ...Base, kind: Schema.Literal("carry") }),
+  Schema.Struct({ ...Base, kind: Schema.Literal("carry"), selection: Schema.optionalKey(SelectionSchema) }),
 ])
-export const StoreSchema = Schema.Struct({ version: Schema.Literal(2), sessions: Schema.Record(Schema.String, Schema.Struct({ items: Schema.Array(EntrySchema), stopped: Schema.Boolean, receipts: Schema.Record(Schema.String, Schema.String) })) })
+export const StoreSchema = Schema.Struct({ version: Schema.Literal(2), migratedV1: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)), sessions: Schema.Record(Schema.String, Schema.Struct({ items: Schema.Array(EntrySchema), stopped: Schema.Boolean, receipts: Schema.Record(Schema.String, Schema.String) })) })
 const SnapshotSchema = Schema.Struct({
   sessionID: Schema.String, items: Schema.Array(EntrySchema), stopped: Schema.Boolean, busy: Schema.Boolean,
   gate: Schema.Literals(["waiting", "ready", "interrupted"]),

@@ -16,7 +16,7 @@ export interface Host {
   log(error: unknown): void
 }
 type Saved = { items: Entry[]; stopped: boolean; receipts: Record<string, string> }
-export type Store = { version: 2; sessions: Record<string, Saved> }
+export type Store = { version: 2; sessions: Record<string, Saved>; migratedV1?: Record<string, string> }
 type Gate = Snapshot["gate"]
 type Barrier = { reached: PromiseWithResolvers<boolean>; release: PromiseWithResolvers<void> }
 type Runtime = {
@@ -256,11 +256,11 @@ export class QueueEngine {
     if ((item.kind === "shell" || item.kind === "carry") && state.busy) return
     // A flush steers matching selections together, then waits for success
     // before starting the next selection group.
-    if (state.busy && state.flushing.has(item.id) && !state.immediate.has(item.id) && state.flushSelection && !equal(state.flushSelection, item.selection)) return
+    if (item.kind !== "carry" && state.busy && state.flushing.has(item.id) && !state.immediate.has(item.id) && state.flushSelection && !equal(state.flushSelection, item.selection)) return
     return item
   }
 
-  private async selection(id: string, item: Entry, generation: number): Promise<boolean> {
+  private async selection(id: string, item: Exclude<Entry, { kind: "carry" }>, generation: number): Promise<boolean> {
     const state = this.state(id)
     // A reloaded server plugin may have missed the execution-started event.
     // Verify idle before changing settings rather than assuming it is idle.
@@ -328,7 +328,9 @@ export class QueueEngine {
     if (!await this.idle(id, state)) return
     const current = await this.host.get(id)
     if (!this.authorized(state, generation)) return
-    const destination = await this.host.create(current, item.selection)
+    const selection = item.selection ?? current.selection
+    if (!selection) throw new Error("The migrated carry boundary needs a model and agent selected in its source session")
+    const destination = await this.host.create(current, selection)
     try {
       const committed = await this.transaction((draft) => {
         const saved = draft.sessions[id]!

@@ -157,8 +157,11 @@ export default Plugin.define({
             selection: { agent: session.agent, model: encodeModel(session.model) }, prompt: encodePrompt(prompt) }, name)
           const waiting = snapshot.items.filter((item) => !snapshot.sending.includes(item.id))
           const status = `${waiting.length} waiting · ${snapshot.stopped ? "paused" : snapshot.gate === "interrupted" ? "suspended" : "running"}`
-          const message = [status, ...(snapshot.error ? [snapshot.error] : []), ...(list ? waiting.map((item, i) =>
-            `${i + 1}. ${item.kind === "carry" ? "Fresh session" : item.prompt.text || "[attachments]"} · ${item.selection.agent} · ${item.selection.model.providerID}/${item.selection.model.id}${item.selection.model.variant ? ` (${item.selection.model.variant})` : ""}`) : [])].join("\n")
+          const message = [status, ...(snapshot.error ? [snapshot.error] : []), ...(list ? waiting.map((item, i) => {
+            const selection = item.selection
+            const model = selection ? `${selection.agent} · ${selection.model.providerID}/${selection.model.id}${selection.model.variant ? ` (${selection.model.variant})` : ""}` : "source session selection"
+            return `${i + 1}. ${item.kind === "carry" ? "Fresh session" : item.prompt.text || "[attachments]"} · ${model}`
+          }) : [])].join("\n")
           await registration.events.emit("report", { sessionID, message, list })
         } })
       })

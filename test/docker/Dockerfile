@@ -1,7 +1,8 @@
 FROM node:24-bookworm-slim
 RUN apt-get update && apt-get install --no-install-recommends -y git ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
-RUN pnpm add --global @opencode/cli@2.0.27 --global-dir /opt/opencode --global-bin-dir /usr/local/bin
+ARG OPENCODE_VERSION=2
+RUN pnpm add --global @opencode/cli@${OPENCODE_VERSION} --global-dir /opt/opencode --global-bin-dir /usr/local/bin
 RUN node /opt/opencode/5/node_modules/@opencode/cli/postinstall.mjs
 WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./

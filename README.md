@@ -58,13 +58,13 @@ The public v2 API lacks native composer access and a way to consume a submission
 
 ## Storage
 
-Queues use `opencode-queue/queues.json` in OpenCode's user data directory. Upgrading from v1 resets pending queues. Entries survive restarts and `/move`, including moves between projects. One server should own a data directory.
+Queues use `opencode-queue/queues.json` in OpenCode's user data directory. Stop OpenCode v1 before upgrading. The plugin migrates pending entries, attachments, agent/model/variant selections, and pause state, then saves the original files in `opencode-queue/v1-backup`. Migrated carry boundaries use the source session's current selection. Entries survive restarts and `/move`, including moves between projects. One server should own a data directory.
 
 Writes are atomic. Replay reuses prompt message IDs; commands and shells can repeat if the server crashes between execution and recording completion.
 
 ## Try in Docker
 
-From this repository, open OpenCode v2 with the plugin loaded:
+From this repository, open the latest stable OpenCode v2 with the plugin loaded:
 
 ```sh
 pnpm start:docker

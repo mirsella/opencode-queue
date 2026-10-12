@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-docker build --quiet -f test/docker/Dockerfile -t opencode-queue-v2-test .
+bash test/docker/build.sh --quiet
 
 mounts=(--mount "type=volume,source=${OPENCODE_QUEUE_DOCKER_VOLUME:-opencode-queue-v2-tui},destination=/workspace/test-state")
 auth="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json"

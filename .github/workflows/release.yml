@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -17,12 +18,29 @@ jobs:
         with:
           node-version: 24
 
+      - name: Require successful CI for this main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "Releases must use a pinned main commit" >&2
+            exit 1
+          fi
+          run=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --event push --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [[ -z "$run" ]]; then
+            echo "No push CI run exists for $GITHUB_SHA" >&2
+            exit 1
+          fi
+          gh run watch "$run" --exit-status
+
       - name: Create GitHub release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(node -p 'require("./package.json").version')"
           tag="v${version}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "::error::Release $tag already exists"
@@ -50,3 +68,12 @@ jobs:
           } > release-notes.md
 
           gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file release-notes.md
+
+      # GITHUB_TOKEN releases do not trigger on.release in publish.yml.
+      - name: Dispatch npm publishing from the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          gh workflow run publish.yml --ref "$RELEASE_TAG" -f dry_run=false -f "expected_sha=$GITHUB_SHA"
+          echo "Publishing $RELEASE_TAG from $GITHUB_SHA through publish.yml." >> "$GITHUB_STEP_SUMMARY"

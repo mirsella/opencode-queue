@@ -10,6 +10,14 @@ on:
         required: true
         default: true
         type: boolean
+      expected_sha:
+        description: Require this exact release commit
+        required: false
+        type: string
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -19,6 +27,15 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v6
+
+      - name: Verify release commit
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          if [ -n "$EXPECTED_SHA" ] && [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+            echo "::error::Expected $EXPECTED_SHA, checked out $(git rev-parse HEAD)"
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@v4
         with:
