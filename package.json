@@ -1,9 +1,9 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-queue",
-  "version": "2.0.1",
+  "version": "1.0.1",
   "type": "module",
-  "description": "Persistent prompt, command and shell queues for OpenCode v2",
+  "description": "Queue OpenCode prompts and slash commands until the agent is idle",
   "main": "./index.ts",
   "keywords": [
     "opencode",
@@ -22,48 +22,34 @@
   "license": "MIT",
   "files": [
     "index.ts",
-    "tui.ts",
-    "src/engine.ts",
-    "src/parser.ts",
-    "src/rpc.ts",
-    "src/shell.ts",
-    "src/storage.ts",
-    "src/types.ts",
     "README.md",
     "LICENSE"
   ],
   "exports": {
-    ".": "./index.ts",
-    "./tui": "./tui.ts",
-    "./rpc": "./src/rpc.ts"
+    ".": "./index.ts"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20.17.0"
   },
   "publishConfig": {
     "access": "public",
-    "tag": "latest"
+    "tag": "opencode1"
   },
   "scripts": {
-    "test": "tsx --test src/*.test.ts",
-    "typecheck": "tsc --noEmit",
-    "test:docker": "bash test/docker/run.sh",
-    "start:docker": "bash test/docker/tui.sh"
+    "test": "tsx --test index.test.js",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode/client": "2.0.27",
-    "@opencode/schema": "2.0.27"
+    "effect": "4.0.0-beta.59"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.0.27",
-    "effect": "4.0.1",
-    "@types/node": "^24.0.0",
+    "@opencode-ai/plugin": "1.19.0",
+    "@opencode-ai/sdk": "1.19.0",
+    "@types/node": "^20.0.0",
     "tsx": "^4.0.0",
     "typescript": "^6.0.3"
   },
-  "peerDependencies": {
-    "@opencode/plugin": ">=2.0.27 <3",
-    "effect": "^4.0.0"
-  },
-  "packageManager": "pnpm@10.32.1"
+  "overrides": {
+    "uuid": "^14.0.0"
+  }
 }
