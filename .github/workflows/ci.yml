@@ -10,12 +10,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+
       - uses: actions/setup-node@v6
         with:
-          node-version: 20.17.0
-          cache: npm
+          node-version: 24
+          cache: pnpm
 
-      - run: npm ci
-      - run: npm test
-      - run: npm run typecheck
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:docker
       - run: npm pack --dry-run
