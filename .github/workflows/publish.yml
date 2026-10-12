@@ -35,6 +35,12 @@ jobs:
           version=$(node -p 'require("./package.json").version')
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          tag=$(node -p 'require("./package.json").publishConfig.tag')
+          case "$version:$tag" in
+            1.*:latest|2.*:v2) ;;
+            *) echo "Unexpected version/channel: $version:$tag" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - id: published
         run: |
@@ -50,4 +56,4 @@ jobs:
         run: npm pack --dry-run
 
       - if: (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && steps.published.outputs.exists != 'true'
-        run: npm publish
+        run: npm publish --tag "${{ steps.package.outputs.tag }}"
