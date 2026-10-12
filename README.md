@@ -6,7 +6,7 @@
 
 Queue OpenCode input until the current session is idle.
 
-Version **1.x supports OpenCode v1**, tested against its final release, **1.19.0**. The unversioned package stays on v1 through npm’s `latest` tag. For OpenCode v2, use [2.x](https://github.com/mirsella/opencode-queue/tree/v2.0.0) with `opencode-queue@v2`.
+Version **1.x supports OpenCode v1**, tested against its final release, **1.19.0**. Use the `opencode1` channel below. For OpenCode v2, use [2.x](https://github.com/mirsella/opencode-queue#install).
 
 `opencode-queue` adds `/queue`, its shorter `/q` alias, and dedicated commands for queue controls. It lets you type the next prompt, slash command, or shell command while an agent is still working, without interrupting the current run.
 
@@ -16,7 +16,7 @@ Add the plugin to your OpenCode config:
 
 ```jsonc
 {
-  "plugin": ["opencode-queue"]
+  "plugin": ["opencode-queue@opencode1"]
 }
 ```
 

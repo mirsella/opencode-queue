@@ -33,7 +33,7 @@
   },
   "publishConfig": {
     "access": "public",
-    "tag": "latest"
+    "tag": "opencode1"
   },
   "scripts": {
     "test": "tsx --test index.test.js",
