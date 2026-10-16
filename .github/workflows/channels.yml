@@ -1,0 +1,48 @@
+name: npm channels
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Full reviewed main commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  remove-obsolete-channel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install --global npm@11.15.0
+      - name: Remove only the obsolete opencode2 channel
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$EXPECTED_SHA" = "$GITHUB_SHA"
+          test "$EXPECTED_SHA" = "$(git ls-remote origin refs/heads/main | cut -f1)"
+          npm view opencode-queue dist-tags --json > "$RUNNER_TEMP/before.json"
+          if node -e 'process.exit(Object.hasOwn(require(process.argv[1]), "opencode2") ? 0 : 1)' "$RUNNER_TEMP/before.json"; then
+            npm dist-tag rm opencode-queue opencode2
+          fi
+          npm view opencode-queue dist-tags --json > "$RUNNER_TEMP/after.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import assert from 'node:assert/strict';
+          const before = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/before.json`));
+          const after = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/after.json`));
+          delete before.opencode2;
+          assert.deepEqual(after, before, 'Only opencode2 may change');
+          assert.ok(after.latest && after.opencode1, 'Both supported channels must remain');
+          console.log(after);
+          NODE
