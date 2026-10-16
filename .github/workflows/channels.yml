@@ -22,7 +22,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - run: npm install --global npm@11.15.0
+      - run: npm install --global npm@11.21.0
       - name: Remove only the obsolete opencode2 channel
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
