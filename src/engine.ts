@@ -192,10 +192,12 @@ export class QueueEngine {
       const previous = waiting[index]
       if (!previous) throw new Error("Queue item number is out of range")
       if (previous.kind === "carry") throw new Error("Fresh-session boundaries cannot be edited")
-      // Attachments survive an edit, but their mention offsets refer to the old
-      // text, so they are dropped before the entry is replayed.
-      const files = replacement.prompt.files?.length
-        ? replacement.prompt.files
+      // Shell and compaction entries never carry attachments, and the edit
+      // input cannot supply new ones. Otherwise the previous files survive,
+      // without their mention offsets, which refer to the old text. Agent and
+      // skill references are dropped along with the text that contained them.
+      const files = replacement.kind === "shell" || replacement.kind === "compact"
+        ? undefined
         : previous.prompt.files?.map(({ mention: _mention, ...file }) => file)
       const position = saved.items.findIndex((item) => item.id === previous.id)
       saved.items[position] = {

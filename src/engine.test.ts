@@ -338,6 +338,28 @@ test("editing replaces text in place and keeps the entry's selection, files and 
   } finally { await f.engine.dispose() }
 })
 
+test("editing into a shell or compaction entry drops attachments, while commands keep them", async () => {
+  const f = fixture()
+  const image = (name: string, text: string) => [{ uri: `file:///${name}.png`, name: `${name}.png`, mention: { start: 7, end: 7 + text.length, text } }]
+  try {
+    await f.submit("/queue:stop")
+    await f.submit("/queue one", A, { prompt: { text: "/queue one", files: image("first", "one") } })
+    await f.submit("/queue two", A, { prompt: { text: "/queue two", files: image("second", "two") } })
+    await f.submit("/queue:edit 1 /review diff")
+    let items = (await f.engine.snapshot("one")).items
+    assert.equal(items[0]!.kind, "command")
+    assert.deepEqual(items[0]!.prompt.files, [{ uri: "file:///first.png", name: "first.png" }])
+    await f.submit("/queue:edit 1 !pwd")
+    items = (await f.engine.snapshot("one")).items
+    assert.equal(items[0]!.kind, "shell")
+    assert.equal(items[0]!.prompt.files, undefined)
+    await f.submit("/queue:edit 2 /compact")
+    items = (await f.engine.snapshot("one")).items
+    assert.equal(items[1]!.kind, "compact")
+    assert.equal(items[1]!.prompt.files, undefined)
+  } finally { await f.engine.dispose() }
+})
+
 test("editing re-parses entry kinds and refuses queue controls, boundaries and out-of-range targets", async () => {
   const f = fixture()
   try {
