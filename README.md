@@ -31,6 +31,7 @@ Enter these in OpenCode's normal input:
 | `/queue !command` | Run a shell command after the session becomes idle. |
 | `/queue:carry`, `/queue:carry-front` | Transfer following entries into a fresh session at this boundary. |
 | `/queue:clear`, `/queue:clear 2 4` | Remove all waiting entries or selected numbered entries. |
+| `/queue:edit [first\|last\|n] text` | Replace a waiting entry's text in place. |
 | `/queue:stop`, `/queue:start` | Pause or resume replay. |
 | `/queue:abort` | Cancel active work and pause replay, including a queued shell or pending model switch. |
 | `/queue:flush` | Release waiting entries through the next carry boundary. |
@@ -41,6 +42,8 @@ Enter these in OpenCode's normal input:
 Replay releases one entry after a successful final response and an idle transition. Tool continuations, output limits, failed compactions, provider failures, and interruptions hold the queue. Resume with `/queue:start` or `/queue:flush`, or complete a new successful run.
 
 `/queue:now` can switch the active model at the next checkpoint: a running tool finishes, then the plugin stops the old execution, switches settings, and continues in the same conversation. Flush groups matching agent/model/variant selections; each new group waits for the previous one to finish successfully.
+
+`/queue:edit` replaces the text of one waiting entry in-place. The last entry is edited when the target is omitted. Numbering matches `/queue:list` and `/queue:clear`. A leading number, `first`, or `last` is read as the target. Replacement text is parsed again. Queue-control text and fresh-session boundaries cannot be edited. Attached files stay attached, but their mention ranges are dropped as they refer to the old text.
 
 Carry boundaries create an empty session in the current directory and transfer the remaining entries, files, and paused state. The TUI follows the new session. A failed transfer leaves the source intact. Flush stops at the boundary.
 

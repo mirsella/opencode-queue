@@ -1,6 +1,6 @@
 import { commands, type Command, type Prompt, type QueuedInput } from "./types.js"
 
-export type Parsed = { control: Command; indices?: number[] } | QueuedInput & {
+export type Parsed = { control: Command; indices?: number[]; edit?: { target: number | "first" | "last"; text: string } } | QueuedInput & {
   front: boolean; delivery: "queue" | "now" | "normal"
 }
 
@@ -32,6 +32,24 @@ export function parse(input: Prompt, command?: Command): Parsed {
     if (numbers.some((value) => !/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))))
       throw new Error("Queue clear expects positive item numbers")
     return { control, indices: [...new Set(numbers.map(Number))] }
+  }
+  if (control === "queue:edit") {
+    if (files || mentions) throw new Error("Queue edit does not accept attachments or mentions")
+    const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text)
+    if (!match) throw new Error("Queue edit expects replacement text")
+    const token = match[1]!
+    let target: number | "first" | "last" = "last"
+    let replacement = text
+    if (token === "first" || token === "last") {
+      target = token
+      replacement = match[2]?.trim() ?? ""
+    } else if (/^\d+$/.test(token)) {
+      if (!/^[1-9]\d*$/.test(token) || !Number.isSafeInteger(Number(token))) throw new Error("Queue edit expects positive item numbers")
+      target = Number(token)
+      replacement = match[2]?.trim() ?? ""
+    }
+    if (!replacement) throw new Error("Queue edit expects replacement text")
+    return { control, edit: { target, text: replacement } }
   }
   if (control && !["queue", "q", "queue:front", "queue:now", "queue:carry", "queue:carry-front"].includes(control)) {
     if (text || files || mentions) throw new Error(`${control} does not accept input`)

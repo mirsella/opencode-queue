@@ -122,6 +122,12 @@ export class QueueEngine {
             saved.items = saved.items.filter((item) => !remove.has(item.id))
           })
           break
+        case "queue:edit": {
+          const edit = op.edit
+          if (!edit) throw new Error("Queue edit expects replacement text")
+          await this.edit(id, edit.target, edit.text)
+          break
+        }
         case "queue:apply_model":
           await this.transaction((draft) => {
             for (const item of draft.sessions[id]?.items ?? []) if (item.id !== state.flight?.id && item.kind !== "carry")
@@ -168,6 +174,37 @@ export class QueueEngine {
       if (!state.busy && session.outcome === "interrupted" && saved.items.length > 1 && delivery !== "now") state.gate = "interrupted"
     }
     this.changed(id); this.kick(id)
+  }
+
+  // Replace the text of a waiting entry in place. The caller already notified
+  // and kicked this session once the edit came back through submitInner.
+  private async edit(id: string, target: number | "first" | "last", text: string): Promise<void> {
+    const parsed = parse({ text })
+    if ("control" in parsed) throw new Error("Queue edit cannot create a queue command")
+    const { front: _front, delivery: _delivery, ...replacement } = parsed
+    await this.transaction((draft) => {
+      const state = this.state(id)
+      if (state.deleted) throw new Error("Session has been deleted")
+      const saved = draft.sessions[id]
+      if (!saved) throw new Error("Queue item number is out of range")
+      const waiting = saved.items.filter((item) => item.id !== state.flight?.id)
+      const index = target === "first" ? 0 : target === "last" ? waiting.length - 1 : target - 1
+      const previous = waiting[index]
+      if (!previous) throw new Error("Queue item number is out of range")
+      if (previous.kind === "carry") throw new Error("Fresh-session boundaries cannot be edited")
+      // Attachments survive an edit, but their mention offsets refer to the old
+      // text, so they are dropped before the entry is replayed.
+      const files = replacement.prompt.files?.length
+        ? replacement.prompt.files
+        : previous.prompt.files?.map(({ mention: _mention, ...file }) => file)
+      const position = saved.items.findIndex((item) => item.id === previous.id)
+      saved.items[position] = {
+        ...replacement,
+        id: previous.id,
+        selection: structuredClone(previous.selection),
+        prompt: { ...replacement.prompt, ...(files?.length ? { files } : {}) },
+      } as Entry
+    })
   }
 
   async observe(id: string, event: "started" | "succeeded" | "failed" | "interrupted" | "deleted" | "rejected", sequence?: number): Promise<void> {
