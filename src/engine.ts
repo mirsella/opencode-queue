@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { parse, type Parsed } from "./parser.js"
-import { type Command, type Entry, type Input, type Notification, type Selection, type Snapshot } from "./types.js"
+import { type Command, type Entry, type Input, type Notification, type Prompt, type Selection, type Snapshot } from "./types.js"
 
 export type Session = { id: string; selection?: Selection; directory: string; outcome?: "succeeded" | "failed" | "interrupted" }
 export interface Host {
@@ -125,7 +125,7 @@ export class QueueEngine {
         case "queue:edit": {
           const edit = op.edit
           if (!edit) throw new Error("Queue edit expects replacement text")
-          await this.edit(id, edit.target, edit.text)
+          await this.edit(id, edit.target, edit.prompt)
           break
         }
         case "queue:apply_model":
@@ -178,8 +178,8 @@ export class QueueEngine {
 
   // Replace the text of a waiting entry in place. The caller already notified
   // and kicked this session once the edit came back through submitInner.
-  private async edit(id: string, target: number | "first" | "last", text: string): Promise<void> {
-    const parsed = parse({ text })
+  private async edit(id: string, target: number | "first" | "last", input: Prompt): Promise<void> {
+    const parsed = parse(input)
     if ("control" in parsed) throw new Error("Queue edit cannot create a queue command")
     const { front: _front, delivery: _delivery, ...replacement } = parsed
     await this.transaction((draft) => {
@@ -192,13 +192,15 @@ export class QueueEngine {
       const previous = waiting[index]
       if (!previous) throw new Error("Queue item number is out of range")
       if (previous.kind === "carry") throw new Error("Fresh-session boundaries cannot be edited")
-      // Shell and compaction entries never carry attachments, and the edit
-      // input cannot supply new ones. Otherwise the previous files survive,
-      // without their mention offsets, which refer to the old text. Agent and
-      // skill references are dropped along with the text that contained them.
-      const files = replacement.kind === "shell" || replacement.kind === "compact"
-        ? undefined
-        : previous.prompt.files?.map(({ mention: _mention, ...file }) => file)
+      // Shell and compaction entries never carry attachments. Otherwise new
+      // attachments replace the inherited ones and keep their mentions, which
+      // the parser rebased onto the new text; inherited files outlive the old
+      // text, but their mention offsets do not.
+      let files: Prompt["files"]
+      if (replacement.kind !== "shell" && replacement.kind !== "compact")
+        files = replacement.prompt.files?.length
+          ? replacement.prompt.files
+          : previous.prompt.files?.map(({ mention: _mention, ...file }) => file)
       const position = saved.items.findIndex((item) => item.id === previous.id)
       saved.items[position] = {
         ...replacement,

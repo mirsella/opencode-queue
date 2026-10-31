@@ -84,16 +84,22 @@ test("queue edits parse an optional target and keep the replacement text intact"
     assert.ok("control" in parsed && parsed.control === "queue:edit")
     return parsed.edit
   }
-  assert.deepEqual(edit("/queue:edit corrected"), { target: "last", text: "corrected" })
-  assert.deepEqual(edit("/queue:edit first corrected"), { target: "first", text: "corrected" })
-  assert.deepEqual(edit("/queue:edit last 2 apples"), { target: "last", text: "2 apples" })
-  assert.deepEqual(edit("/queue:edit 2 /review diff"), { target: 2, text: "/review diff" })
-  assert.deepEqual(edit("/queue:edit 3 42"), { target: 3, text: "42" })
-  assert.deepEqual(edit("/queue:edit 1e2 apples"), { target: "last", text: "1e2 apples" })
+  assert.deepEqual(edit("/queue:edit corrected"), { target: "last", prompt: { text: "corrected" } })
+  assert.deepEqual(edit("/queue:edit first corrected"), { target: "first", prompt: { text: "corrected" } })
+  assert.deepEqual(edit("/queue:edit last 2 apples"), { target: "last", prompt: { text: "2 apples" } })
+  assert.deepEqual(edit("/queue:edit 2 /review diff"), { target: 2, prompt: { text: "/review diff" } })
+  assert.deepEqual(edit("/queue:edit 3 42"), { target: 3, prompt: { text: "42" } })
+  assert.deepEqual(edit("/queue:edit 1e2 apples"), { target: "last", prompt: { text: "1e2 apples" } })
   for (const text of ["/queue:edit", "/queue:edit first", "/queue:edit 2", "/queue:edit 0 corrected", "/queue:edit 999999999999999999 corrected"])
     assert.throws(() => edit(text))
-  assert.throws(() => edit("/queue:edit 2 corrected", { files: [{ uri: "file:///image.png" }] }))
-  assert.throws(() => edit("/queue:edit 2 corrected", { agents: [{ name: "build" }] }))
+  const text = "/queue:edit 2 use @file"
+  const files = [{ uri: "file:///image.png", mention: { start: text.indexOf("@file"), end: text.length, text: "@file" } }]
+  assert.deepEqual(edit(text, { files }), {
+    target: 2,
+    prompt: { text: "use @file", files: [{ uri: "file:///image.png", mention: { start: text.indexOf("@file") - text.indexOf("use"), end: "use @file".length, text: "@file" } }] },
+  })
+  // Mentions inside the control prefix or target token cannot fall within the replacement text.
+  assert.throws(() => edit("/queue:edit 2 use", { files: [{ uri: "file:///image.png", mention: { start: 12, end: 13, text: "2" } }] }), /Mention is outside/)
 })
 
 test("suffix queue markers remain literal prompt text", () => {
@@ -357,6 +363,25 @@ test("editing into a shell or compaction entry drops attachments, while commands
     items = (await f.engine.snapshot("one")).items
     assert.equal(items[1]!.kind, "compact")
     assert.equal(items[1]!.prompt.files, undefined)
+  } finally { await f.engine.dispose() }
+})
+
+test("editing with new attachments replaces inherited files and keeps their mentions", async () => {
+  const f = fixture()
+  try {
+    await f.submit("/queue:stop")
+    await f.submit("/queue one", A, { prompt: { text: "/queue one", files: [{ uri: "file:///old.png", name: "old.png", mention: { start: 7, end: 10, text: "one" } }] } })
+    const text = "/queue:edit 1 use @new"
+    await f.submit(text, A, { prompt: { text, files: [{ uri: "file:///new.png", name: "new.png", mention: { start: text.indexOf("@new"), end: text.length, text: "@new" } }] } })
+    const item = (await f.engine.snapshot("one")).items[0]!
+    assert.equal(item.prompt.text, "use @new")
+    assert.deepEqual(item.prompt.files, [{
+      uri: "file:///new.png",
+      name: "new.png",
+      mention: { start: text.indexOf("@new") - text.indexOf("use"), end: "use @new".length, text: "@new" },
+    }])
+    await assert.rejects(f.submit("/queue:edit 1 !pwd", A, { prompt: { text: "/queue:edit 1 !pwd", files: [{ uri: "file:///new.png" }] } }), /cannot have attachments/)
+    assert.equal((await f.engine.snapshot("one")).items[0]!.prompt.text, "use @new")
   } finally { await f.engine.dispose() }
 })
 

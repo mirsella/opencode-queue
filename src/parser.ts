@@ -1,6 +1,6 @@
 import { commands, type Command, type Prompt, type QueuedInput } from "./types.js"
 
-export type Parsed = { control: Command; indices?: number[]; edit?: { target: number | "first" | "last"; text: string } } | QueuedInput & {
+export type Parsed = { control: Command; indices?: number[]; edit?: { target: number | "first" | "last"; prompt: Prompt } } | QueuedInput & {
   front: boolean; delivery: "queue" | "now" | "normal"
 }
 
@@ -34,22 +34,27 @@ export function parse(input: Prompt, command?: Command): Parsed {
     return { control, indices: [...new Set(numbers.map(Number))] }
   }
   if (control === "queue:edit") {
-    if (files || mentions) throw new Error("Queue edit does not accept attachments or mentions")
     const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text)
     if (!match) throw new Error("Queue edit expects replacement text")
     const token = match[1]!
+    const numbered = /^\d+$/.test(token)
+    const targeted = token === "first" || token === "last" || numbered
     let target: number | "first" | "last" = "last"
-    let replacement = text
-    if (token === "first" || token === "last") {
-      target = token
-      replacement = match[2]?.trim() ?? ""
-    } else if (/^\d+$/.test(token)) {
+    if (token === "first" || token === "last") target = token
+    else if (numbered) {
       if (!/^[1-9]\d*$/.test(token) || !Number.isSafeInteger(Number(token))) throw new Error("Queue edit expects positive item numbers")
       target = Number(token)
-      replacement = match[2]?.trim() ?? ""
+    }
+    let replacement = text
+    if (targeted) {
+      const rest = match[2] ?? ""
+      replacement = rest.trim()
+      // Mentions are relative to the submitted text, so move them past the
+      // control prefix and the target token before they reach the entry.
+      offset += text.length - rest.length + (rest.length - rest.trimStart().length)
     }
     if (!replacement) throw new Error("Queue edit expects replacement text")
-    return { control, edit: { target, text: replacement } }
+    return { control, edit: { target, prompt: shiftPrompt(input, replacement, -offset) } }
   }
   if (control && !["queue", "q", "queue:front", "queue:now", "queue:carry", "queue:carry-front"].includes(control)) {
     if (text || files || mentions) throw new Error(`${control} does not accept input`)
