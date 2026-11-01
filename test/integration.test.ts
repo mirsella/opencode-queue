@@ -312,6 +312,68 @@ test("a server restart retains paused queues, attachments and saved selection", 
   const start = events.length; reply(restored); await terminal(id, start)
 })
 
+test("native command arguments rebase attachment mentions from the full input line", { timeout: 30_000 }, async () => {
+  const id = await create(), uri = `file://${join(directory, "notes.txt")}`
+  await writeFile(join(directory, "notes.txt"), "notes")
+  await client.session.command({ sessionID: id, name: "queue:stop", text: "" })
+  await client.session.command({ sessionID: id, name: "queue", text: "one" })
+  await client.session.command({ sessionID: id, name: "queue", text: "two" })
+  // The TUI strips "/queue:edit " before invoking the command, but keeps the
+  // mention range measured from the full input line.
+  await client.session.command({ sessionID: id, name: "queue:edit", text: "2 summarize @notes.txt ",
+    files: [{ uri, name: "notes.txt", mention: { start: 24, end: 34, text: "@notes.txt" } }] })
+  const saved = await queue.snapshot({ sessionID: id })
+  assert.equal(saved.items[1]?.prompt.text, "summarize @notes.txt")
+  assert.deepEqual(saved.items[1]?.prompt.files, [{ uri, name: "notes.txt", mention: { start: 10, end: 20, text: "@notes.txt" } }])
+  const mention = saved.items[1]?.prompt.files?.[0]?.mention
+  assert.ok(mention && saved.items[1]!.prompt.text.slice(mention.start, mention.end) === "@notes.txt")
+})
+
+test("queue edits replace numbered and last waiting entries before replay", { timeout: 30_000 }, async () => {
+  const id = await create(), start = requests.length
+  await submit(id, "/queue:stop")
+  await submit(id, "/queue [queue-test:edit-before-first]")
+  await submit(id, "/queue [queue-test:edit-before-last]")
+  await client.session.command({ sessionID: id, name: "queue:edit", text: "1 [queue-test:edit-after-first] " })
+  await client.session.command({ sessionID: id, name: "queue:edit", text: "[queue-test:edit-after-last] " })
+  const saved = await queue.snapshot({ sessionID: id })
+  assert.deepEqual(saved.items.map((item) => item.prompt.text), ["[queue-test:edit-after-first]", "[queue-test:edit-after-last]"])
+  assert.deepEqual(saved.items.map((item) => item.selection?.model.id), ["a", "a"])
+  await submit(id, "/queue:start")
+  const first = await request("edit-after-first", start)
+  assert.ok(JSON.stringify(first.body).includes("[queue-test:edit-after-first]"))
+  assert.ok(!JSON.stringify(first.body).includes("edit-before"))
+  const firstFinish = events.length; reply(first); await terminal(id, firstFinish)
+  const last = await request("edit-after-last", start)
+  assert.ok(JSON.stringify(last.body).includes("[queue-test:edit-after-last]"))
+  assert.ok(!JSON.stringify(last.body).includes("edit-before"))
+  const lastFinish = events.length; reply(last); await terminal(id, lastFinish)
+})
+
+test("queue edits keep inherited files, can become shells, and report invalid targets", { timeout: 30_000 }, async () => {
+  const id = await create(), uri = `data:text/plain;base64,${Buffer.from("edited attachment").toString("base64")}`
+  await submit(id, "/queue:stop")
+  await submit(id, "/queue [queue-test:edit-file]", A, [{ uri }])
+  await client.session.command({ sessionID: id, name: "queue:edit", text: "[queue-test:edit-file-text] " })
+  let saved = await queue.snapshot({ sessionID: id })
+  assert.equal(saved.items[0]?.prompt.text, "[queue-test:edit-file-text]")
+  assert.deepEqual(saved.items[0]?.prompt.files, [{ uri }])
+  await assert.rejects(client.session.command({ sessionID: id, name: "queue:edit", text: "9 nope " }), /out of range/)
+  await client.session.command({ sessionID: id, name: "queue:edit", text: "!printf queue-edit-shell " })
+  saved = await queue.snapshot({ sessionID: id })
+  assert.equal(saved.items[0]?.kind, "shell")
+  assert.equal(saved.items[0]?.prompt.files, undefined)
+  // opencode holds shell output in the session inbox until the next model
+  // turn, so queue a prompt after the shell and check that turn.
+  await submit(id, "/queue [queue-test:after-edit-shell]")
+  const start = events.length, requestStart = requests.length
+  await submit(id, "/queue:start")
+  const next = await request("after-edit-shell", requestStart)
+  assert.ok(JSON.stringify(next.body).includes("queue-edit-shell"))
+  reply(next); await terminal(id, start)
+  assert.ok(JSON.stringify(await client.session.context({ sessionID: id })).includes("queue-edit-shell"))
+})
+
 test("native TUI slash commands queue privately and list entries in the native dialog", { timeout: 40_000 }, async () => {
   const id = await create(), launch = join(root, "tui-launch.sh")
   await client.session.switchModel({ sessionID: id, model: { providerID: "queue-test", id: "a" } })

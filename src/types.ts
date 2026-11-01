@@ -25,6 +25,7 @@ export const commands = {
   "queue:carry-front": "Insert a fresh-session boundary at the front",
   "queue:list": "Show waiting entries",
   "queue:clear": "Clear all entries or numbered entries",
+  "queue:edit": "Replace the text of a waiting entry",
   "queue:stop": "Pause the queue",
   "queue:abort": "Stop active work and pause the queue",
   "queue:start": "Resume the queue",

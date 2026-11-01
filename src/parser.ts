@@ -1,6 +1,6 @@
 import { commands, type Command, type Prompt, type QueuedInput } from "./types.js"
 
-export type Parsed = { control: Command; indices?: number[] } | QueuedInput & {
+export type Parsed = { control: Command; indices?: number[]; edit?: { target: number | "first" | "last"; prompt: Prompt } } | QueuedInput & {
   front: boolean; delivery: "queue" | "now" | "normal"
 }
 
@@ -12,6 +12,12 @@ export function shiftPrompt(input: Prompt, text: string, offset: number): Prompt
     if (item.mention.start < 0 || item.mention.end > text.length) throw new Error("Mention is outside the submitted input")
   }
   return prompt
+}
+
+// Native commands receive the text after "/<name> ", but their mention ranges
+// still count from the start of the full input line.
+export function offsetPrompt<T extends Prompt>(input: T, name: string): T {
+  return shiftPrompt(input, input.text, -(name.length + 2)) as T
 }
 
 export function parse(input: Prompt, command?: Command): Parsed {
@@ -32,6 +38,29 @@ export function parse(input: Prompt, command?: Command): Parsed {
     if (numbers.some((value) => !/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))))
       throw new Error("Queue clear expects positive item numbers")
     return { control, indices: [...new Set(numbers.map(Number))] }
+  }
+  if (control === "queue:edit") {
+    const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text)
+    if (!match) throw new Error("Queue edit expects replacement text")
+    const token = match[1]!
+    const numbered = /^\d+$/.test(token)
+    const targeted = token === "first" || token === "last" || numbered
+    let target: number | "first" | "last" = "last"
+    if (token === "first" || token === "last") target = token
+    else if (numbered) {
+      if (!/^[1-9]\d*$/.test(token) || !Number.isSafeInteger(Number(token))) throw new Error("Queue edit expects positive item numbers")
+      target = Number(token)
+    }
+    let replacement = text
+    if (targeted) {
+      const rest = match[2] ?? ""
+      replacement = rest.trim()
+      // Mentions are relative to the submitted text, so move them past the
+      // control prefix and the target token before they reach the entry.
+      offset += text.length - rest.length + (rest.length - rest.trimStart().length)
+    }
+    if (!replacement) throw new Error("Queue edit expects replacement text")
+    return { control, edit: { target, prompt: shiftPrompt(input, replacement, -offset) } }
   }
   if (control && !["queue", "q", "queue:front", "queue:now", "queue:carry", "queue:carry-front"].includes(control)) {
     if (text || files || mentions) throw new Error(`${control} does not accept input`)

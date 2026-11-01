@@ -3,7 +3,7 @@ import { test } from "node:test"
 import { EventEmitter } from "node:events"
 import { randomUUID } from "node:crypto"
 import { QueueEngine, type Host, type Store, type Session } from "./engine.js"
-import { parse } from "./parser.js"
+import { offsetPrompt, parse } from "./parser.js"
 import type { Entry, Input, Notification, Selection, Snapshot } from "./types.js"
 
 const A: Selection = { agent: "build", model: { providerID: "test", id: "a", variant: "xhigh" } }
@@ -78,6 +78,30 @@ test("parses queue syntax, commands, shells and carries without mutating attachm
   assert.throws(() => parse({ text: "/queue !pwd", files }))
 })
 
+test("queue edits parse an optional target and keep the replacement text intact", () => {
+  const edit = (text: string, extra: Partial<Parameters<typeof parse>[0]> = {}) => {
+    const parsed = parse({ text, ...extra })
+    assert.ok("control" in parsed && parsed.control === "queue:edit")
+    return parsed.edit
+  }
+  assert.deepEqual(edit("/queue:edit corrected"), { target: "last", prompt: { text: "corrected" } })
+  assert.deepEqual(edit("/queue:edit first corrected"), { target: "first", prompt: { text: "corrected" } })
+  assert.deepEqual(edit("/queue:edit last 2 apples"), { target: "last", prompt: { text: "2 apples" } })
+  assert.deepEqual(edit("/queue:edit 2 /review diff"), { target: 2, prompt: { text: "/review diff" } })
+  assert.deepEqual(edit("/queue:edit 3 42"), { target: 3, prompt: { text: "42" } })
+  assert.deepEqual(edit("/queue:edit 1e2 apples"), { target: "last", prompt: { text: "1e2 apples" } })
+  for (const text of ["/queue:edit", "/queue:edit first", "/queue:edit 2", "/queue:edit 0 corrected", "/queue:edit 999999999999999999 corrected"])
+    assert.throws(() => edit(text))
+  const text = "/queue:edit 2 use @file"
+  const files = [{ uri: "file:///image.png", mention: { start: text.indexOf("@file"), end: text.length, text: "@file" } }]
+  assert.deepEqual(edit(text, { files }), {
+    target: 2,
+    prompt: { text: "use @file", files: [{ uri: "file:///image.png", mention: { start: text.indexOf("@file") - text.indexOf("use"), end: "use @file".length, text: "@file" } }] },
+  })
+  // Mentions inside the control prefix or target token cannot fall within the replacement text.
+  assert.throws(() => edit("/queue:edit 2 use", { files: [{ uri: "file:///image.png", mention: { start: 12, end: 13, text: "2" } }] }), /Mention is outside/)
+})
+
 test("suffix queue markers remain literal prompt text", () => {
   for (const text of ["hello /q", "hello /queue"]) {
     const parsed = parse({ text })
@@ -96,6 +120,23 @@ test("native command arguments keep nested slash commands and mention ranges", (
   assert.equal(parsed.front, true)
   assert.deepEqual(parsed.prompt.agents?.[0]?.mention, { start: 7, end: 13, text: "@build" })
   assert.equal(input.agents[0]!.mention.start, 9)
+})
+
+test("native command arguments rebase mentions measured from the full input line", async () => {
+  const f = fixture()
+  try {
+    await f.submit("/queue:stop"); await f.submit("/queue one"); await f.submit("/queue two")
+    const text = "2 summarize @notes.txt "
+    const prompt = { text, files: [{ uri: "file:///notes.txt", name: "notes.txt", mention: { start: 24, end: 34, text: "@notes.txt" } }] }
+    // Full line -> handler text removes "/queue:edit " (12 chars): mention 12-22.
+    const rebased = offsetPrompt(prompt, "queue:edit")
+    assert.deepEqual(rebased.files?.[0]?.mention, { start: 12, end: 22, text: "@notes.txt" })
+    // Handler text -> entry replacement removes "2 ": mention 10-20.
+    await f.engine.submit(f.input(text, A, { prompt: rebased }), "queue:edit")
+    const saved = await f.engine.snapshot("one")
+    assert.equal(saved.items[1]?.prompt.text, "summarize @notes.txt")
+    assert.deepEqual(saved.items[1]?.prompt.files, [{ uri: "file:///notes.txt", name: "notes.txt", mention: { start: 10, end: 20, text: "@notes.txt" } }])
+  } finally { await f.engine.dispose() }
 })
 
 test("native list feedback follows parsed commands and treats attachment-only input as entries", async () => {
@@ -298,6 +339,111 @@ test("front insertion and selective clear validate all indices before mutating",
   await f.submit("/queue:clear 2")
   assert.deepEqual((await f.engine.snapshot("one")).items.map((item) => item.prompt.text), ["zero", "two"])
   await f.engine.dispose()
+})
+
+test("editing replaces text in place and keeps the entry's selection, files and position", async () => {
+  const f = fixture()
+  const files = [{ uri: "file:///image.png", name: "image.png", mention: { start: 7, end: 10, text: "two" } }]
+  try {
+    await f.submit("/queue:stop"); await f.submit("/queue one"); await f.submit("/queue two", B, { prompt: { text: "/queue two", files } })
+    const before = (await f.engine.snapshot("one")).items
+    await f.submit("/queue:edit last corrected")
+    const after = (await f.engine.snapshot("one")).items
+    assert.deepEqual(after.map((item) => item.prompt.text), ["one", "corrected"])
+    assert.deepEqual(after.map((item) => item.id), before.map((item) => item.id))
+    assert.deepEqual(after[1]!.selection, B)
+    // Mention offsets describe the old text and are dropped with the edit.
+    assert.deepEqual(after[1]!.prompt.files, [{ uri: "file:///image.png", name: "image.png" }])
+    assert.equal(f.sent.length, 0)
+    await f.submit("/queue:edit tail")
+    assert.deepEqual((await f.engine.snapshot("one")).items.map((item) => item.prompt.text), ["one", "tail"])
+    assert.equal(f.sent.length, 0)
+  } finally { await f.engine.dispose() }
+})
+
+test("editing into a shell or compaction entry drops attachments, while commands keep them", async () => {
+  const f = fixture()
+  const image = (name: string, text: string) => [{ uri: `file:///${name}.png`, name: `${name}.png`, mention: { start: 7, end: 7 + text.length, text } }]
+  try {
+    await f.submit("/queue:stop")
+    await f.submit("/queue one", A, { prompt: { text: "/queue one", files: image("first", "one") } })
+    await f.submit("/queue two", A, { prompt: { text: "/queue two", files: image("second", "two") } })
+    await f.submit("/queue:edit 1 /review diff")
+    let items = (await f.engine.snapshot("one")).items
+    assert.equal(items[0]!.kind, "command")
+    assert.deepEqual(items[0]!.prompt.files, [{ uri: "file:///first.png", name: "first.png" }])
+    await f.submit("/queue:edit 1 !pwd")
+    items = (await f.engine.snapshot("one")).items
+    assert.equal(items[0]!.kind, "shell")
+    assert.equal(items[0]!.prompt.files, undefined)
+    await f.submit("/queue:edit 2 /compact")
+    items = (await f.engine.snapshot("one")).items
+    assert.equal(items[1]!.kind, "compact")
+    assert.equal(items[1]!.prompt.files, undefined)
+  } finally { await f.engine.dispose() }
+})
+
+test("editing with new attachments replaces inherited files and keeps their mentions", async () => {
+  const f = fixture()
+  try {
+    await f.submit("/queue:stop")
+    await f.submit("/queue one", A, { prompt: { text: "/queue one", files: [{ uri: "file:///old.png", name: "old.png", mention: { start: 7, end: 10, text: "one" } }] } })
+    const text = "/queue:edit 1 use @new"
+    await f.submit(text, A, { prompt: { text, files: [{ uri: "file:///new.png", name: "new.png", mention: { start: text.indexOf("@new"), end: text.length, text: "@new" } }] } })
+    const item = (await f.engine.snapshot("one")).items[0]!
+    assert.equal(item.prompt.text, "use @new")
+    assert.deepEqual(item.prompt.files, [{
+      uri: "file:///new.png",
+      name: "new.png",
+      mention: { start: text.indexOf("@new") - text.indexOf("use"), end: "use @new".length, text: "@new" },
+    }])
+    await assert.rejects(f.submit("/queue:edit 1 !pwd", A, { prompt: { text: "/queue:edit 1 !pwd", files: [{ uri: "file:///new.png" }] } }), /cannot have attachments/)
+    assert.equal((await f.engine.snapshot("one")).items[0]!.prompt.text, "use @new")
+  } finally { await f.engine.dispose() }
+})
+
+test("editing re-parses entry kinds and refuses queue controls, boundaries and out-of-range targets", async () => {
+  const f = fixture()
+  try {
+    await f.submit("/queue:stop"); await f.submit("/queue one")
+    await f.submit("/queue:edit first !pwd")
+    let items = (await f.engine.snapshot("one")).items
+    assert.equal(items[0]!.kind, "shell")
+    assert.equal(items[0]!.kind === "shell" ? items[0]!.command : undefined, "pwd")
+    await f.submit("/queue:edit 1 /review diff")
+    items = (await f.engine.snapshot("one")).items
+    assert.equal(items[0]!.kind, "command")
+    assert.equal(items[0]!.kind === "command" ? items[0]!.command : undefined, "review")
+    await assert.rejects(f.submit("/queue:edit 1 /queue:start"), /cannot create a queue command/)
+    await assert.rejects(f.submit("/queue:edit 2 nope"), /out of range/)
+    await assert.rejects(f.submit("/queue:edit"), /replacement text/)
+    assert.equal((await f.engine.snapshot("one")).items.length, 1)
+    await f.submit("/queue:clear"); await f.submit("/queue:carry")
+    await assert.rejects(f.submit("/queue:edit first nope"), /Fresh-session boundaries/)
+  } finally { await f.engine.dispose() }
+})
+
+test("editing numbers skip the entry currently being sent", async () => {
+  const f = fixture(), started = deferred(), release = deferred()
+  f.host.send = async (_sessionID, item) => { f.sent.push({ sessionID: "one", item }); started.resolve(); await release.promise }
+  try {
+    await f.submit("/queue active"); await started.promise
+    await f.submit("/queue waiting")
+    await f.submit("/queue:edit 1 corrected")
+    assert.deepEqual((await f.engine.snapshot("one")).items.map((item) => item.prompt.text), ["active", "corrected"])
+    await assert.rejects(f.submit("/queue:edit 2 nope"), /out of range/)
+    release.resolve(); await f.engine.settled()
+  } finally { release.resolve(); await f.engine.dispose() }
+})
+
+test("a failed edit persists nothing and keeps the original text", async () => {
+  const f = fixture()
+  try {
+    await f.submit("/queue:stop"); await f.submit("/queue original")
+    f.host.persist = async () => { throw new Error("disk full") }
+    await assert.rejects(f.submit("/queue:edit first changed"), /disk full/)
+    assert.deepEqual((await f.engine.snapshot("one")).items.map((item) => item.prompt.text), ["original"])
+  } finally { await f.engine.dispose() }
 })
 
 test("disk failures preserve memory and no unpersisted entry is sent", async () => {
