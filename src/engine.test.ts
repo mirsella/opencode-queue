@@ -128,10 +128,14 @@ test("native command arguments rebase mentions measured from the full input line
     await f.submit("/queue:stop"); await f.submit("/queue one"); await f.submit("/queue two")
     const text = "2 summarize @notes.txt "
     const prompt = { text, files: [{ uri: "file:///notes.txt", name: "notes.txt", mention: { start: 24, end: 34, text: "@notes.txt" } }] }
-    await f.engine.submit(f.input(text, A, { prompt: offsetPrompt(prompt, "queue:edit") }), "queue:edit")
-    const item = (await f.engine.snapshot("one")).items[1]!
-    assert.equal(item.prompt.text, "summarize @notes.txt")
-    assert.deepEqual(item.prompt.files, [{ uri: "file:///notes.txt", name: "notes.txt", mention: { start: 10, end: 20, text: "@notes.txt" } }])
+    // Full line -> handler text removes "/queue:edit " (12 chars): mention 12-22.
+    const rebased = offsetPrompt(prompt, "queue:edit")
+    assert.deepEqual(rebased.files?.[0]?.mention, { start: 12, end: 22, text: "@notes.txt" })
+    // Handler text -> entry replacement removes "2 ": mention 10-20.
+    await f.engine.submit(f.input(text, A, { prompt: rebased }), "queue:edit")
+    const saved = await f.engine.snapshot("one")
+    assert.equal(saved.items[1]?.prompt.text, "summarize @notes.txt")
+    assert.deepEqual(saved.items[1]?.prompt.files, [{ uri: "file:///notes.txt", name: "notes.txt", mention: { start: 10, end: 20, text: "@notes.txt" } }])
   } finally { await f.engine.dispose() }
 })
 
