@@ -363,9 +363,14 @@ test("queue edits keep inherited files, can become shells, and report invalid ta
   saved = await queue.snapshot({ sessionID: id })
   assert.equal(saved.items[0]?.kind, "shell")
   assert.equal(saved.items[0]?.prompt.files, undefined)
-  const start = events.length
+  // opencode holds shell output in the session inbox until the next model
+  // turn, so queue a prompt after the shell and check that turn.
+  await submit(id, "/queue [queue-test:after-edit-shell]")
+  const start = events.length, requestStart = requests.length
   await submit(id, "/queue:start")
-  await wait(() => events.slice(start).find((event) => event.type === "session.synthetic" && (event.data as any).sessionID === id), "edited shell replay")
+  const next = await request("after-edit-shell", requestStart)
+  assert.ok(JSON.stringify(next.body).includes("queue-edit-shell"))
+  reply(next); await terminal(id, start)
   assert.ok(JSON.stringify(await client.session.context({ sessionID: id })).includes("queue-edit-shell"))
 })
 
