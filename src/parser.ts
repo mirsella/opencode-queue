@@ -14,6 +14,12 @@ export function shiftPrompt(input: Prompt, text: string, offset: number): Prompt
   return prompt
 }
 
+// Native commands receive the text after "/<name> ", but their mention ranges
+// still count from the start of the full input line.
+export function offsetPrompt<T extends Prompt>(input: T, name: string): T {
+  return shiftPrompt(input, input.text, -(name.length + 2)) as T
+}
+
 export function parse(input: Prompt, command?: Command): Parsed {
   let text = input.text.trim()
   let offset = input.text.length - input.text.trimStart().length

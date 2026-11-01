@@ -312,6 +312,21 @@ test("a server restart retains paused queues, attachments and saved selection", 
   const start = events.length; reply(restored); await terminal(id, start)
 })
 
+test("native command arguments rebase attachment mentions from the full input line", { timeout: 30_000 }, async () => {
+  const id = await create(), uri = `file://${join(directory, "notes.txt")}`
+  await writeFile(join(directory, "notes.txt"), "notes")
+  await client.session.command({ sessionID: id, name: "queue:stop", text: "" })
+  await client.session.command({ sessionID: id, name: "queue", text: "one" })
+  await client.session.command({ sessionID: id, name: "queue", text: "two" })
+  // The TUI strips "/queue:edit " before invoking the command, but keeps the
+  // mention range measured from the full input line.
+  await client.session.command({ sessionID: id, name: "queue:edit", text: "2 summarize @notes.txt ",
+    files: [{ uri, name: "notes.txt", mention: { start: 24, end: 34, text: "@notes.txt" } }] })
+  const saved = await queue.snapshot({ sessionID: id })
+  assert.equal(saved.items[1]?.prompt.text, "summarize @notes.txt")
+  assert.deepEqual(saved.items[1]?.prompt.files, [{ uri, name: "notes.txt", mention: { start: 10, end: 20, text: "@notes.txt" } }])
+})
+
 test("native TUI slash commands queue privately and list entries in the native dialog", { timeout: 40_000 }, async () => {
   const id = await create(), launch = join(root, "tui-launch.sh")
   await client.session.switchModel({ sessionID: id, model: { providerID: "queue-test", id: "a" } })

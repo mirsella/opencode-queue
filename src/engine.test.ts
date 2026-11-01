@@ -3,7 +3,7 @@ import { test } from "node:test"
 import { EventEmitter } from "node:events"
 import { randomUUID } from "node:crypto"
 import { QueueEngine, type Host, type Store, type Session } from "./engine.js"
-import { parse } from "./parser.js"
+import { offsetPrompt, parse } from "./parser.js"
 import type { Entry, Input, Notification, Selection, Snapshot } from "./types.js"
 
 const A: Selection = { agent: "build", model: { providerID: "test", id: "a", variant: "xhigh" } }
@@ -120,6 +120,19 @@ test("native command arguments keep nested slash commands and mention ranges", (
   assert.equal(parsed.front, true)
   assert.deepEqual(parsed.prompt.agents?.[0]?.mention, { start: 7, end: 13, text: "@build" })
   assert.equal(input.agents[0]!.mention.start, 9)
+})
+
+test("native command arguments rebase mentions measured from the full input line", async () => {
+  const f = fixture()
+  try {
+    await f.submit("/queue:stop"); await f.submit("/queue one"); await f.submit("/queue two")
+    const text = "2 summarize @notes.txt "
+    const prompt = { text, files: [{ uri: "file:///notes.txt", name: "notes.txt", mention: { start: 24, end: 34, text: "@notes.txt" } }] }
+    await f.engine.submit(f.input(text, A, { prompt: offsetPrompt(prompt, "queue:edit") }), "queue:edit")
+    const item = (await f.engine.snapshot("one")).items[1]!
+    assert.equal(item.prompt.text, "summarize @notes.txt")
+    assert.deepEqual(item.prompt.files, [{ uri: "file:///notes.txt", name: "notes.txt", mention: { start: 10, end: 20, text: "@notes.txt" } }])
+  } finally { await f.engine.dispose() }
 })
 
 test("native list feedback follows parsed commands and treats attachment-only input as entries", async () => {

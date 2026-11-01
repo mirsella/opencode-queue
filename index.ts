@@ -5,7 +5,7 @@ import { Schema } from "effect"
 import { randomUUID } from "node:crypto"
 import { join, resolve } from "node:path"
 import { QueueEngine } from "./src/engine.js"
-import { shiftPrompt } from "./src/parser.js"
+import { offsetPrompt, shiftPrompt } from "./src/parser.js"
 import { QueueRpc } from "./src/rpc.js"
 import { dataDirectory, loadStore, queuePath, writeJSON } from "./src/storage.js"
 import { shell } from "./src/shell.js"
@@ -154,7 +154,7 @@ export default Plugin.define({
           const session = await ctx.session.get({ sessionID })
           if (!session.agent || !session.model) throw new Error("Select an agent and model before using queue commands")
           const { snapshot, list } = await engine.submit({ sessionID, requestID: randomUUID(),
-            selection: { agent: session.agent, model: encodeModel(session.model) }, prompt: encodePrompt(prompt) }, name)
+            selection: { agent: session.agent, model: encodeModel(session.model) }, prompt: encodePrompt(offsetPrompt(prompt, name)) }, name)
           const waiting = snapshot.items.filter((item) => !snapshot.sending.includes(item.id))
           const status = `${waiting.length} waiting · ${snapshot.stopped ? "paused" : snapshot.gate === "interrupted" ? "suspended" : "running"}`
           const message = [status, ...(snapshot.error ? [snapshot.error] : []), ...(list ? waiting.map((item, i) => {
